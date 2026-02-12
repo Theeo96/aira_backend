@@ -1,0 +1,82 @@
+# [통합 가이드] 뉴스 에이전트 (NewsAgent)
+
+이 문서는 `backend/modules/news_agent.py` 모듈을 `aia_main.py`에 통합하기 위한 지침입니다.
+팀 작업 규칙에 따라 메인 파일을 직접 수정하지 않고, 아래 내용을 복사하여 적절한 위치에 붙여넣어 주세요.
+
+---
+
+### 0. 환경 변수 설정 (.env)
+**위치:** 프로젝트 루트의 `.env` 파일
+**설명:** 위치 기반 서비스를 사용하기 위해 Azure Maps 키가 필요합니다. 기존 프로젝트의 `.env` 파일에서 복사하거나 새로 발급받아 추가해주세요.
+
+```env
+AZURE_MAPS_SUBSCRIPTION_KEY= (이미 .env에 설정하셨습니다)
+```
+
+---
+
+### 1. Import 구문 추가
+**위치:** `aira_main.py` 파일의 최상단 import 영역 (약 10번째 줄 부근)
+
+```python
+# [NEW] 뉴스 에이전트 모듈 import
+from modules.news_agent import NewsAgent, NewsConfig
+```
+
+---
+
+### 2. 초기화 (Initialization)
+**위치:** `aira_main.py` 내부, `gemini_worker()` 함수 시작 부분 (Client 연결 전)
+
+```python
+    # [NEW] NewsAgent 초기화
+    # 필요시 설정을 변경할 수 있습니다.
+    news_config = NewsConfig()
+    news_config.URGENT_CHECK_INTERVAL = 30  # 테스트를 위해 30초로 단축 가능
+    news_agent = NewsAgent(config=news_config)
+    print("📰 NewsAgent Loaded.")
+```
+
+---
+
+### 3. 긴급 속보 확인 및 인터럽트 (Main Loop Integration)
+**위치:** `gemini_worker()` 내부, `send_loop()` 함수 안의 `while True:` 루프 시작 부분
+**설명:** 루프가 돌 때마다 주기적으로 긴급 뉴스를 체크하고, 속보가 있으면 즉시 시스템 메시지를 주입합니다.
+
+```python
+                    # [NEW] 1. 긴급 속보 체크 (Non-blocking)
+                    # 1분마다 체크 (NewsAgent 내부 로직)
+                    urgent_msg = news_agent.fetch_and_sort_news()
+                    if urgent_msg:
+                        print(f"🚨 [INTERRUPT] {urgent_msg}")
+                        # Gemini에게 텍스트로 속보 내용을 주입하여 즉시 발화 유도
+                        await session.send(
+                            input=f"[SYSTEM] 긴급 속보가 발생했습니다. 즉시 사용자에게 알리세요: {urgent_msg}",
+                            end_of_turn=True
+                        )
+```
+
+---
+
+### 4. 심심풀이 뉴스 (Filler Integration)
+**위치:** `receive_loop()` 내부 또는 별도의 Silence Detector 로직
+**설명:** 대화가 3초 이상 끊겼을 때(Silence), 주머니에서 뉴스를 꺼내 대화 주제로 던집니다.
+
+```python
+                        # [NEW] 2. 대화 공백 시 뉴스 제안 (예시 로직)
+                        # (실제로는 VAD나 Silence Timer가 필요함)
+                        # if silence_duration > news_config.SILENCE_THRESHOLD:
+                        #     story = news_agent.get_story_from_pocket()
+                        #     if story:
+                        #         filler_msg = f"참, 그건 그렇고.. {story} 라는 소식이 있네요."
+                        #         # Gemini에게 발화 유도
+```
+
+---
+
+### [참고] 의존성 라이브러리
+아래 패키지가 `requirements.txt`에 포함되어 있어야 합니다.
+```
+feedparser
+requests
+```
