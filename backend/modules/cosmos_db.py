@@ -18,7 +18,8 @@ class CosmosDBService:
             return
 
         try:
-            self.client = CosmosClient(ENDPOINT, KEY)
+            # [Fix] Set connection timeout to prevent zombie processes (5 seconds)
+            self.client = CosmosClient(ENDPOINT, KEY, connection_timeout=5000)
             self.database = self.client.create_database_if_not_exists(id=DATABASE_NAME)
             self.container = self.database.create_container_if_not_exists(
                 id=CONTAINER_NAME,

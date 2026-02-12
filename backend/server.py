@@ -16,7 +16,18 @@ import sys
 from modules.cosmos_db import cosmos_service
 from modules.memory import memory_service
 
-app = FastAPI()
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup logic
+    print("[Server] Starting up... (Lifespan Event)")
+    yield
+    # Shutdown logic
+    print("[Server] Shutting down... (Lifespan Event)")
+
+app = FastAPI(lifespan=lifespan)
+
 
 # Enable CORS
 app.add_middleware(
@@ -72,7 +83,9 @@ async def audio_websocket(ws: WebSocket):
 
     # 2. Load Memory (Context)
     # Fetch ALL past summaries for this user
-    past_memories = cosmos_service.get_all_memories(user_id)
+    # Fetch ALL past summaries for this user (Blocking I/O -> Async Thread)
+    # past_memories = cosmos_service.get_all_memories(user_id) 
+    past_memories = await asyncio.to_thread(cosmos_service.get_all_memories, user_id)
     memory_context = ""
     if past_memories:
         memory_context = "Here is the summary of past conversations with this user:\n"
@@ -151,7 +164,8 @@ async def audio_websocket(ws: WebSocket):
                         data = await ws.receive_bytes()
                         if not data: continue
                         await session.send_realtime_input(audio={"data": data, "mime_type": "audio/pcm;rate=16000"})
-                        user_push_stream.write(data)
+                        # [Fix] Pushing to Azure Stream might block if internal buffer is full. Offload to thread.
+                        await asyncio.to_thread(user_push_stream.write, data)
                 except WebSocketDisconnect:
                     print("[Server] WebSocket Disconnected (Receive Loop)")
                     return # Clean exit logic will be handled by finally block
@@ -167,7 +181,8 @@ async def audio_websocket(ws: WebSocket):
                                     if part.inline_data:
                                         audio_bytes = part.inline_data.data
                                         await ws.send_bytes(audio_bytes)
-                                        ai_push_stream.write(audio_bytes)
+                                        # [Fix] Offload AI audio write to thread
+                                        await asyncio.to_thread(ai_push_stream.write, audio_bytes)
                                         # Update state: Audio received, not flushed yet
                                         state["last_ai_write_time"] = asyncio.get_running_loop().time()
                                         state["flushed"] = False
@@ -191,7 +206,7 @@ async def audio_websocket(ws: WebSocket):
                         # If > 500ms passed since last audio AND we haven't flushed yet
                         if (now - state["last_ai_write_time"] > 0.5) and (not state["flushed"]):
                             print("[STT] Pause detected. Injecting silence to flush buffer.")
-                            ai_push_stream.write(silence_chunk)
+                            await asyncio.to_thread(ai_push_stream.write, silence_chunk)
                             state["flushed"] = True # Mark as flushed to STOP sending silence
                             
                 except asyncio.CancelledError:
@@ -215,8 +230,13 @@ async def audio_websocket(ws: WebSocket):
     finally:
         # Cleanup
         print("[Server] Cleaning up resources...")
-        user_recognizer.stop_continuous_recognition()
-        ai_recognizer.stop_continuous_recognition()
+        try:
+            # Execute cleanup asynchronously with TIMEOUT to avoid blocking the Event Loop
+            # If Azure takes too long to stop, we just abandon it to prevent "Waiting for child process" hang.
+            await asyncio.wait_for(asyncio.to_thread(user_recognizer.stop_continuous_recognition), timeout=2.0)
+            await asyncio.wait_for(asyncio.to_thread(ai_recognizer.stop_continuous_recognition), timeout=2.0)
+        except Exception as e:
+            print(f"[Server] Cleanup Warning: {e}")
         try: await ws.close() 
         except: pass
         print("[Server] Connection closed")
@@ -225,18 +245,26 @@ async def audio_websocket(ws: WebSocket):
         if session_transcript and len(session_transcript) > 2: # Don't save empty sessions
             print("[Memory] Summarizing session...")
             full_text = "\n".join(session_transcript)
-            summary_json = memory_service.summarize(full_text)
             
-            if summary_json:
-                cosmos_service.save_memory(user_id, full_text, summary_json)
+            # Blocking I/O -> Async Thread
+            summary_json = await asyncio.to_thread(memory_service.summarize, full_text)
+            
+            if summary_json and summary_json.get("context_summary"):
+                await asyncio.to_thread(cosmos_service.save_memory, user_id, full_text, summary_json)
                 print(f"[Memory] Session saved for {user_id}")
             else:
-                print("[Memory] Summarization failed or returned empty.")
+                print("[Memory] Skipped saving: Summary is empty or invalid.")
 
 # --- Static Files (Frontend) ---
 FRONTEND_BUILD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "temp_front", "out")
 
 if os.path.exists(FRONTEND_BUILD_DIR):
+    # [Fix] Explicitly set MIME types for Windows Server compatibility
+    import mimetypes
+    mimetypes.add_type("application/javascript", ".js")
+    mimetypes.add_type("text/css", ".css")
+    mimetypes.add_type("image/svg+xml", ".svg")
+    
     app.mount("/", StaticFiles(directory=FRONTEND_BUILD_DIR, html=True), name="static")
 else:
     @app.get("/")

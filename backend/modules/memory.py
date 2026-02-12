@@ -29,9 +29,10 @@ class MemoryService:
             self.client = AzureOpenAI(
                 api_key=AZURE_OPENAI_API_KEY,  
                 api_version=AZURE_OPENAI_API_VERSION,
-                azure_endpoint=base_endpoint
+                azure_endpoint=base_endpoint,
+                timeout=5.0 # [Fix] Set timeout to prevent zombie processes
             )
-            print("[Memory] Azure OpenAI Client initialized.")
+            print("[Memory] Azure OpenAI Client initialized (Timeout: 5s).")
         except Exception as e:
             print(f"[Memory] Client Init Error: {e}")
             self.client = None
@@ -41,18 +42,28 @@ class MemoryService:
             return None
 
         system_prompt = """
-        Summarize the following conversation transcript into a JSON structure.
+        You are an AI assistant that summarizes conversation transcripts into a JSON format.
         
-        Instructions:
-        - Summarize the conversation flow and context in full sentences.
-        - Include specific entities (Names, Numbers, Dates, Locations) mentioned.
-        - Identify the user's primary emotion/sentiment.
-        - The summary output MUST be in KOREAN.
+        [Instructions]
+        1. Analyze the provided conversation transcript.
+        2. Summarize the context and flow in Korean.
+           (IMPORTANT: Explicitly record nouns, names, object names, and numbers in the summary.)
+        3. Identify the user's primary emotion and target from the lists below.
+        4. If the transcript is empty or contains only noise, return empty strings.
 
-        Output JSON Format:
+        [Emotion List] (Select one)
+        Positive: Excited, Proud, Grateful, Impressed, Hopeful, Confident, Joyful, Content, Prepared, Caring, Trusting, Faithful
+        Negative/Complex: Surprised, Angry, Sad, Annoyed, Lonely, Afraid, Terrified, Guilty, Disgusted, Furious, Anxious, Anticipating, Nostalgic, Disappointed, Jealous, Devastated, Embarrassed, Sentimental, Ashamed, Apprehensive
+
+        [Target List] (Select one)
+        Options: "나" (Self), "친구", "지인", "직장동료", "가족", "타인"
+
+        [Output JSON Format]
         {
-            "context_summary": "...",
-            "sentiment": "..."
+            "context_summary": "Summary in Korean",
+            "sentiment": "Selected Emotion Tag",
+            "status": "Positive" or "Negative",
+            "target": "Selected Target"
         }
         """
 
@@ -62,7 +73,7 @@ class MemoryService:
                 model=AZURE_OPENAI_DEPLOYMENT_NAME,
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Transcript:\n{transcript}"}
+                    {"role": "user", "content": f"<transcript>\n{transcript}\n</transcript>"}
                 ],
                 response_format={ "type": "json_object" }
             )
