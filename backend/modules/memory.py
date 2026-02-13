@@ -51,9 +51,9 @@ class MemoryService:
         3. Identify the user's primary emotion and target from the lists below.
         4. If the transcript is empty or contains only noise, return empty strings.
 
-        [Emotion List] (Select one)
-        Positive: Excited, Proud, Grateful, Impressed, Hopeful, Confident, Joyful, Content, Prepared, Caring, Trusting, Faithful
-        Negative/Complex: Surprised, Angry, Sad, Annoyed, Lonely, Afraid, Terrified, Guilty, Disgusted, Furious, Anxious, Anticipating, Nostalgic, Disappointed, Jealous, Devastated, Embarrassed, Sentimental, Ashamed, Apprehensive
+        [Emotion Groups]
+        - Positive Group: Excited, Proud, Grateful, Impressed, Hopeful, Confident, Joyful, Content, Prepared, Caring, Trusting, Faithful
+        - Negative Group: Surprised, Angry, Sad, Annoyed, Lonely, Afraid, Terrified, Guilty, Disgusted, Furious, Anxious, Anticipating, Nostalgic, Disappointed, Jealous, Devastated, Embarrassed, Sentimental, Ashamed, Apprehensive
 
         [Target List] (Select one)
         Options: "나" (Self), "친구", "지인", "직장동료", "가족", "타인"
@@ -61,8 +61,8 @@ class MemoryService:
         [Output JSON Format]
         {
             "context_summary": "Summary in Korean",
-            "sentiment": "Selected Emotion Tag",
-            "status": "Positive" or "Negative",
+            "sentiment": "Selected Emotion Tag (MUST be one of the specific tags from the groups above. DO NOT use 'Positive' or 'Negative' here.)",
+            "status": "The Group Name of the selected sentiment ('Positive' or 'Negative')",
             "target": "Selected Target"
         }
         """
