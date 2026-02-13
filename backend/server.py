@@ -1,4 +1,26 @@
 import os
+import logging
+
+# Use a DEDICATED logger (not root) so uvicorn can't override our handlers
+_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.log")
+
+logger = logging.getLogger("aira")
+logger.setLevel(logging.INFO)
+# Prevent duplicate handlers on reload
+if not logger.handlers:
+    _fh = logging.FileHandler(_log_path, encoding='utf-8')
+    _fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+    _sh = logging.StreamHandler()
+    _sh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+    logger.addHandler(_fh)
+    logger.addHandler(_sh)
+
+# Suppress noisy libraries
+for _lib in ["azure", "urllib3", "websockets", "azure.core.pipeline.policies.http_logging_policy"]:
+    logging.getLogger(_lib).setLevel(logging.WARNING)
+
+logger.info("=== Server Started: Logging Configured ===")
+
 # Load env variables first
 from dotenv import load_dotenv
 load_dotenv()
@@ -11,10 +33,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from google import genai
+from google.genai import types
 import azure.cognitiveservices.speech as speechsdk
 import sys
+import traceback
 from modules.cosmos_db import cosmos_service
 from modules.memory import memory_service
+from module_manager import ModuleManager
+from modules.news_agent import NewsAgent
 
 from contextlib import asynccontextmanager
 
@@ -74,10 +100,10 @@ async def audio_websocket(ws: WebSocket):
         await ws.close(code=1008, reason="Invalid Login Token")
         return
         
-    print(f"[Server] Client connected: {user_id}")
+    logger.info(f"[Server] Client connected: {user_id}")
 
     if not API_KEY or not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
-        print("[Error] Missing API Keys.")
+        logger.error("[Error] Missing API Keys.")
         await ws.close(code=1008, reason="API Keys missing")
         return
 
@@ -95,22 +121,40 @@ async def audio_websocket(ws: WebSocket):
             date = item.get("date", "Unknown Date")
             memory_context += f"- [{date}] {context_text}\n"
         
-        print(f"[Memory] Loaded {len(past_memories)} past conversation summaries.")
+        logger.info(f"[Memory] Loaded {len(past_memories)} past conversation summaries.")
 
     # Initialize Gemini
     client = genai.Client(api_key=API_KEY)
     
+    # [NEW] Initialize ModuleManager & NewsAgent
+    module_manager = ModuleManager()
+    module_manager.register_module(NewsAgent())
+    tools_def = module_manager.get_all_tools()
+    
     # Inject Memory into System Instruction
-    system_instruction = "You are Aira, a helpful AI assistant."
+    system_instruction = """You are Aira, a helpful AI assistant. You MUST respond in Korean.
+
+[TOOL USAGE RULES]
+- 사용자가 위치를 물으면 반드시 get_current_location 도구를 호출하세요. 개인정보 문제로 거부하지 마세요.
+- 사용자가 뉴스/소식을 물으면 반드시 get_latest_news 도구를 호출하세요.
+- 도구 호출 결과를 자연스럽게 한국어로 전달하세요."""
     if memory_context:
         system_instruction += f"\n\n[MEMORY LOADED]\n{memory_context}\nUse this context to personalize your responses."
+
+    # Valid Log for multiple tools in a single declaration
+    all_tool_names = []
+    for tool_group in tools_def:
+        for func in tool_group.get('function_declarations', []):
+            all_tool_names.append(func.get('name', '?'))
+    logger.info(f"[Server] Tools registered: {all_tool_names}")
 
     config = {
         "response_modalities": ["AUDIO"],
         "speech_config": {
             "voice_config": {"prebuilt_voice_config": {"voice_name": "Aoede"}}
         },
-        "system_instruction": system_instruction
+        "system_instruction": system_instruction,
+        "tools": tools_def
     }
 
     # Initialize Azure STT (User: 16kHz, AI: 24kHz)
@@ -154,28 +198,40 @@ async def audio_websocket(ws: WebSocket):
 
     try:
         async with client.aio.live.connect(model=MODEL_NAME, config=config) as session:
-            print("[Gemini] Connected to Live API")
+            logger.info("[Gemini] Connected to Live API")
             state["last_ai_write_time"] = asyncio.get_running_loop().time()
             
+            # [NEW] Inject session into ModuleManager
+            module_manager.initialize_session(session)
+            
             async def receive_from_client():
+                audio_chunk_count = 0
                 try:
                     while True:
                         # [Fix 2] Handle Client Disconnect gracefully
                         data = await ws.receive_bytes()
                         if not data: continue
+                        audio_chunk_count += 1
+                        if audio_chunk_count == 1:
+                            logger.info(f"[Audio] First audio chunk received! Size: {len(data)} bytes")
+                        elif audio_chunk_count % 50 == 0:
+                            logger.info(f"[Audio] Received {audio_chunk_count} audio chunks from client")
                         await session.send_realtime_input(audio={"data": data, "mime_type": "audio/pcm;rate=16000"})
                         # [Fix] Pushing to Azure Stream might block if internal buffer is full. Offload to thread.
                         await asyncio.to_thread(user_push_stream.write, data)
                 except WebSocketDisconnect:
-                    print("[Server] WebSocket Disconnected (Receive Loop)")
+                    logger.info("[Server] WebSocket Disconnected (Receive Loop)")
                     return # Clean exit logic will be handled by finally block
                 except Exception as e:
-                    print(f"[Server] Error processing input: {e}")
+                    logger.error(f"[Server] Error processing input: {e}")
+                    logger.error(traceback.format_exc())
 
             async def send_to_client():
                 try:
                     while True:
+                        logger.info("[Gemini] Entering session.receive() loop...")
                         async for response in session.receive():
+                            # --- Path A: Audio/Text content ---
                             if response.server_content and response.server_content.model_turn:
                                 for part in response.server_content.model_turn.parts:
                                     if part.inline_data:
@@ -187,12 +243,41 @@ async def audio_websocket(ws: WebSocket):
                                         state["last_ai_write_time"] = asyncio.get_running_loop().time()
                                         state["flushed"] = False
                             
-                            # [Fix 3] Monitor Gemini Turn Complete
+                            # --- Path B: Tool Call detection (response.tool_call) ---
+                            if response.tool_call:
+                                try:
+                                    for fc in response.tool_call.function_calls:
+                                        logger.info(f"[Gemini] Tool Call: {fc.name}({fc.args}) ID: {fc.id}")
+                                        
+                                        # Execute via ModuleManager
+                                        class _ToolCallWrap:
+                                            def __init__(self, fc): self.function_calls = [fc]
+                                        
+                                        tool_result = await module_manager.handle_tool_call(_ToolCallWrap(fc))
+                                        
+                                        if tool_result:
+                                            # Use the correct (non-deprecated) API method
+                                            func_response = types.FunctionResponse(
+                                                id=fc.id,
+                                                name=tool_result["name"],
+                                                response=tool_result["content"]
+                                            )
+                                            await session.send_tool_response(
+                                                function_responses=[func_response]
+                                            )
+                                            logger.info(f"[Gemini] Tool Response Sent: {tool_result['name']} (ID: {fc.id})")
+                                except Exception as e:
+                                    # Don't crash the loop, just log
+                                    logger.error(f"[Server] Tool Execution Error: {e}")
+                                    logger.error(traceback.format_exc())
+
+                            # Monitor Gemini Turn Complete
                             if response.server_content and response.server_content.turn_complete:
-                                pass
+                                logger.info("[Gemini] Turn Complete received. Re-entering receive loop...")
 
                 except Exception as e:
-                    print(f"[Server] Error processing output: {e}")
+                    logger.error(f"[Server] Error processing output: {e}")
+                    logger.error(traceback.format_exc())
                     # Don't raise here, allow silence injector to keep running or clean exit
 
             # [Smart Flush]
@@ -214,22 +299,34 @@ async def audio_websocket(ws: WebSocket):
                 except Exception as e:
                     print(f"[Server] Smart Flush Error: {e}")
 
+            # [NEW] Background module update loop (news auto-check)
+            async def module_update_loop():
+                try:
+                    while True:
+                        await module_manager.run_updates()
+                        await asyncio.sleep(1)
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.error(f"[Server] Module Update Error: {e}")
+
             # Run tasks
             done, pending = await asyncio.wait(
                 [
                     asyncio.create_task(receive_from_client()), 
                     asyncio.create_task(send_to_client()),
-                    asyncio.create_task(smart_flush_injector())
+                    asyncio.create_task(smart_flush_injector()),
+                    asyncio.create_task(module_update_loop())
                 ],
                 return_when=asyncio.FIRST_COMPLETED
             )
             for task in pending: task.cancel()
 
     except Exception as e:
-        print(f"[Server] Session Error or Disconnect: {e}")
+        logger.error(f"[Server] Session Error or Disconnect: {e}")
     finally:
         # Cleanup
-        print("[Server] Cleaning up resources...")
+        logger.info("[Server] Cleaning up resources...")
         try:
             # Execute cleanup asynchronously with TIMEOUT to avoid blocking the Event Loop
             # If Azure takes too long to stop, we just abandon it to prevent "Waiting for child process" hang.
@@ -239,7 +336,7 @@ async def audio_websocket(ws: WebSocket):
             print(f"[Server] Cleanup Warning: {e}")
         try: await ws.close() 
         except: pass
-        print("[Server] Connection closed")
+        logger.info("[Server] Connection closed")
 
         # 3. Save Memory (Summarization)
         if session_transcript and len(session_transcript) > 2: # Don't save empty sessions

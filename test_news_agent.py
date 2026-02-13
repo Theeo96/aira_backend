@@ -1,3 +1,7 @@
+import asyncio
+import os
+import sys
+from dotenv import load_dotenv
 
 # .env 로드
 load_dotenv()
@@ -7,54 +11,41 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'backend'))
 
 from backend.modules.news_agent import NewsAgent, NewsConfig
 
-def test_news_agent():
-    print("[NewsAgent] Testing...")
+# Mock Session Class
+class MockSession:
+    async def send(self, input, end_of_turn=True):
+        print(f"[MockSession] Sending to Gemini: {input}")
+
+async def test_news_agent():
+    print("[NewsAgent] Testing Update Loop...")
     
-    # 설정: 테스트를 위해 짧은 주기로 변경
+    # 1. 설정 (즉시 실행되도록)
     config = NewsConfig()
-    config.URGENT_CHECK_INTERVAL = 0 # 즉시 확인
-    config.NORMAL_CHECK_INTERVAL = 0 # 즉시 확인
-    config.USE_LOCATION = True # 위치 기반 테스트
+    config.URGENT_CHECK_INTERVAL = 0 # 항상 체크
+    config.NORMAL_CHECK_INTERVAL = 0 # 항상 체크
+    config.USE_LOCATION = True 
     
     agent = NewsAgent(config)
     
-    # 1. 위치 확인 테스트
-    print("\n--- 1. Location Test ---")
-    location = agent.get_current_location()
-    print(f"Current Location: {location}")
-    if location:
-        print("[Location] Fetched successfully.")
-    else:
-        print("[Location] Fetch failed (Check Azure Key or Network).")
+    # 2. 세션 주입 (Mock)
+    mock_session = MockSession()
+    agent.initialize(mock_session)
+    
+    print("\n--- Running agent.update() ---")
+    # 3. update() 실행 (비동기)
+    await agent.update()
+    
+    # 4. 결과 확인
+    # 로그를 통해 확인 가능 (fetch 성공 여부 등)
+    print("\n[Test] Update finished. Check logs above for '[Urgent]...' or '[Pocket]...' messages.")
 
-    # 2. 뉴스 가져오기 테스트
-    print("\n--- 2. Fetch News Test ---")
-    urgent = agent.fetch_and_sort_news()
-    if urgent:
-        print(f"[Urgent] {urgent}")
-    else:
-        print("[Urgent] No urgent news found (Normal).")
-        
-    # 3. 스토리 포켓 테스트
-    print("\n--- 3. Story Pocket Test ---")
-    print(f"Pocket Size: {len(agent.story_pocket)}")
-    for i, story in enumerate(agent.story_pocket):
-        print(f"[{i+1}] {story}")
-        
-    # 4. 필러 꺼내기 테스트
-    print("\n--- 4. Filler Test ---")
-    # 확률 무시하고 강제로 꺼내기 위해 임시 조작
-    agent.config.FILLER_PROBABILITY = 1.0 
-    filler = agent.get_story_from_pocket()
-    print(f"Pop Story: {filler}")
+    # 추가 테스트: 포켓 확인
+    print(f"\n[Test] Story Pocket Size: {len(agent.story_pocket)}")
+    if agent.story_pocket:
+        print(f"[Test] First story in pocket: {agent.story_pocket[0]}")
 
 if __name__ == "__main__":
-    try:
-        # 윈도우 인코딩 설정
-        if sys.platform == 'win32':
-             sys.stdout.reconfigure(encoding='utf-8')
-        test_news_agent()
-    except Exception as e:
-        print(f"[Error] Test Failed: {e}")
-        import traceback
-        traceback.print_exc()
+    if sys.platform == 'win32':
+        sys.stdout.reconfigure(encoding='utf-8')
+    
+    asyncio.run(test_news_agent())
