@@ -11,6 +11,7 @@ type TranscriptMessage = {
 export default function Home() {
   const [isConnected, setIsConnected] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
+  const [isConnecting, setIsConnecting] = useState(false);
   const [status, setStatus] = useState("Disconnected");
   const [transcripts, setTranscripts] = useState<TranscriptMessage[]>([]);
 
@@ -19,6 +20,7 @@ export default function Home() {
   const [loginInput, setLoginInput] = useState("");
 
   const websocketRef = useRef<WebSocket | null>(null);
+  const locationTimerRef = useRef<number | null>(null);
   const playbackContextRef = useRef<AudioContext | null>(null);
   const nextStartTimeRef = useRef<number>(0);
   const chatBottomRef = useRef<HTMLDivElement>(null);
@@ -30,6 +32,7 @@ export default function Home() {
     if (savedToken) setUserToken(savedToken);
 
     return () => {
+      clearLocationTimer();
       if (websocketRef.current) websocketRef.current.close();
       stopAudioProcessing();
     };
@@ -62,29 +65,115 @@ export default function Home() {
     window.open("https://8ai-th-loginback-atcyfgfcgbfxcvhx.koreacentral-01.azurewebsites.net/login", "_blank");
   };
 
-  const connectWebSocket = useCallback(() => {
+  const clearLocationTimer = () => {
+    if (locationTimerRef.current) {
+      window.clearInterval(locationTimerRef.current);
+      locationTimerRef.current = null;
+    }
+  };
+
+  const sendLocationUpdate = useCallback(async (ws?: WebSocket | null) => {
+    const socket = ws || websocketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    try {
+      const position = await new Promise<GeolocationPosition>((resolve, reject) => {
+        if (!navigator.geolocation) {
+          reject(new Error("Geolocation not supported"));
+          return;
+        }
+        navigator.geolocation.getCurrentPosition(resolve, reject, {
+          enableHighAccuracy: true,
+          timeout: 5000,
+          maximumAge: 10000,
+        });
+      });
+      socket.send(
+        JSON.stringify({
+          type: "location_update",
+          lat: position.coords.latitude,
+          lng: position.coords.longitude,
+        })
+      );
+    } catch (e) {
+      console.warn("Location update failed:", e);
+    }
+  }, []);
+
+  const connectWebSocket = useCallback(async () => {
     if (!userToken) return;
+    if (isConnecting) return;
+    setIsConnecting(true);
+    setStatus("Connecting...");
+    if (websocketRef.current) {
+      websocketRef.current.close();
+      websocketRef.current = null;
+    }
 
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const host = window.location.host;
-    // Pass user_id query param
-    const wsUrl = `${protocol}//${host}/ws/audio?user_id=${encodeURIComponent(userToken)}`;
+    let latParam = "";
+    let lngParam = "";
+    try {
+      const position = await new Promise<GeolocationPosition>((resolve, reject) => {
+        if (!navigator.geolocation) {
+          reject(new Error("Geolocation not supported"));
+          return;
+        }
+        navigator.geolocation.getCurrentPosition(resolve, reject, {
+          enableHighAccuracy: true,
+          timeout: 5000,
+          maximumAge: 30000,
+        });
+      });
+      latParam = `&lat=${encodeURIComponent(position.coords.latitude)}`;
+      lngParam = `&lng=${encodeURIComponent(position.coords.longitude)}`;
+    } catch (e) {
+      console.warn("Geolocation unavailable:", e);
+      setStatus("Location permission required. Use localhost and allow location.");
+      setIsConnecting(false);
+      return;
+    }
+
+    const wsUrl = `${protocol}//${host}/ws/audio?user_id=${encodeURIComponent(userToken)}${latParam}${lngParam}`;
 
     const ws = new WebSocket(wsUrl);
     websocketRef.current = ws;
 
     ws.onopen = () => {
+      if (websocketRef.current !== ws) return;
       setIsConnected(true);
+      setIsConnecting(false);
       setStatus("Connected to Aira");
       console.log("WebSocket Connected");
+      sendLocationUpdate(ws);
+      clearLocationTimer();
+      locationTimerRef.current = window.setInterval(() => {
+        sendLocationUpdate(ws);
+      }, 60000);
     };
 
     ws.onclose = () => {
+      if (websocketRef.current !== ws) return;
+      websocketRef.current = null;
+      clearLocationTimer();
+      stopAudioProcessing();
       setIsConnected(false);
+      setIsConnecting(false);
       setStatus("Disconnected");
     };
 
+    ws.onerror = () => {
+      if (websocketRef.current !== ws) return;
+      websocketRef.current = null;
+      clearLocationTimer();
+      stopAudioProcessing();
+      setIsConnected(false);
+      setIsConnecting(false);
+      setStatus("WebSocket Error");
+    };
+
     ws.onmessage = async (event) => {
+      if (websocketRef.current !== ws) return;
       if (event.data instanceof Blob) {
         // Audio Data
         const arrayBuffer = await event.data.arrayBuffer();
@@ -101,7 +190,7 @@ export default function Home() {
         }
       }
     };
-  }, [userToken]);
+  }, [userToken, isConnecting, sendLocationUpdate]);
 
   const playAudioChunk = useCallback((arrayBuffer: ArrayBuffer) => {
     if (!playbackContextRef.current) {
@@ -133,14 +222,25 @@ export default function Home() {
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const inputContextRef = useRef<AudioContext | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
 
   const startAudioProcessing = async () => {
+    if (!websocketRef.current || websocketRef.current.readyState !== WebSocket.OPEN) {
+      setStatus("Connect first");
+      return;
+    }
+    if (isRecording) return;
     try {
+      await sendLocationUpdate(websocketRef.current);
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
       });
+      micStreamRef.current = stream;
       inputContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       const ctx = inputContextRef.current;
+      if (ctx.state === "suspended") {
+        await ctx.resume();
+      }
       sourceRef.current = ctx.createMediaStreamSource(stream);
       processorRef.current = ctx.createScriptProcessor(4096, 1, 1);
 
@@ -167,10 +267,17 @@ export default function Home() {
 
   const stopAudioProcessing = () => {
     processorRef.current?.disconnect();
+    processorRef.current = null;
     sourceRef.current?.disconnect();
+    sourceRef.current = null;
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach((t) => t.stop());
+      micStreamRef.current = null;
+    }
     inputContextRef.current?.close();
+    inputContextRef.current = null;
     setIsRecording(false);
-    setStatus("Idle");
+    if (isConnected) setStatus("Idle");
   };
 
   if (!userToken) {
@@ -241,8 +348,12 @@ export default function Home() {
 
         <div className="w-full">
           {!isConnected ? (
-            <button onClick={connectWebSocket} className="w-full py-3 rounded-lg bg-blue-600 hover:bg-blue-700 transition font-bold">
-              Connect
+            <button
+              onClick={connectWebSocket}
+              disabled={isConnecting}
+              className={`w-full py-3 rounded-lg transition font-bold ${isConnecting ? "bg-gray-600 cursor-not-allowed" : "bg-blue-600 hover:bg-blue-700"}`}
+            >
+              {isConnecting ? "Connecting..." : "Connect"}
             </button>
           ) : (
             <button onClick={isRecording ? stopAudioProcessing : startAudioProcessing}

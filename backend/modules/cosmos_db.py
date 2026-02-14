@@ -39,6 +39,7 @@ class CosmosDBService:
 
         memory_item = {
             "id": str(uuid.uuid4()),
+            "doc_type": "memory",
             "user_id": user_id,
             "date": now,
             "full_transcript": full_transcript,
@@ -54,7 +55,11 @@ class CosmosDBService:
     def get_all_memories(self, user_id):
         if not self.container: return []
 
-        query = "SELECT * FROM c WHERE c.user_id = @user_id ORDER BY c.date ASC"
+        query = (
+            "SELECT * FROM c WHERE c.user_id = @user_id "
+            "AND (NOT IS_DEFINED(c.doc_type) OR c.doc_type = 'memory') "
+            "ORDER BY c.date ASC"
+        )
         params = [{"name": "@user_id", "value": user_id}]
 
         try:
@@ -67,5 +72,38 @@ class CosmosDBService:
         except Exception as e:
             print(f"[CosmosDB] Fetch Error: {e}")
             return []
+
+    def get_user_profile(self, user_id):
+        if not self.container:
+            return None
+        profile_id = f"profile:{user_id}"
+        try:
+            return self.container.read_item(item=profile_id, partition_key=user_id)
+        except Exception:
+            return None
+
+    def upsert_user_profile(self, user_id, profile_updates: dict):
+        if not self.container:
+            return None
+        kst = pytz.timezone("Asia/Seoul")
+        now = datetime.now(kst).isoformat()
+        profile_id = f"profile:{user_id}"
+
+        current = self.get_user_profile(user_id) or {
+            "id": profile_id,
+            "doc_type": "profile",
+            "user_id": user_id,
+            "created_at": now,
+        }
+        current.update(profile_updates or {})
+        current["updated_at"] = now
+
+        try:
+            self.container.upsert_item(body=current)
+            print(f"[CosmosDB] Profile upserted for {user_id}")
+            return current
+        except Exception as e:
+            print(f"[CosmosDB] Profile Upsert Error: {e}")
+            return None
 
 cosmos_service = CosmosDBService()

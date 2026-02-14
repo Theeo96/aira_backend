@@ -1,0 +1,8 @@
+﻿{
+  "name": "seoul-info-module",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Portable Seoul transit/culture info extraction module for voice assistants",
+  "main": "./src/index.ts"
+}
