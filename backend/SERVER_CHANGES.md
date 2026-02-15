@@ -2000,3 +2000,30 @@
 ### impact
 - behavior preserved; orchestration moved to module.
 - `server.py` websocket section became shorter and easier to diff/merge.
+
+## 2026-02-15 - server.py cleanup step 5 (Vision service module split)
+- branch: `mun-cleanup-server`
+- purpose: reduce websocket/vision branching size in `server.py` by moving camera state and frame handling into a module.
+
+### changes
+- added: `backend/modules/vision_service.py`
+  - added `VisionService` class.
+  - owns camera state (`enabled`, frame counters, latest snapshot, timestamps).
+  - handles:
+    - camera on/off transitions,
+    - base64 frame decode + realtime Gemini frame send,
+    - snapshot decode/storage + optional send,
+    - recent snapshot retrieval for vision-related user turns.
+- updated: `backend/server.py`
+  - added `from modules.vision_service import VisionService`
+  - replaced inline `camera_state` dict with `vision_service` instance.
+  - removed inline `_send_camera_frame_to_gemini` function.
+  - replaced camera payload branches with module calls:
+    - `set_camera_enabled`
+    - `handle_camera_frame_payload`
+    - `handle_camera_snapshot_payload`
+  - user STT vision hint path now uses `get_recent_snapshot_for_query(...)`.
+
+### impact
+- behavior preserved; logic moved to module.
+- `server.py` websocket receive block is shorter and easier to merge.

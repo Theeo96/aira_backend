@@ -4,7 +4,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import asyncio
-import base64
 import json
 import math
 import numpy as np
@@ -28,6 +27,7 @@ from modules.gmail_alert_module import GmailAlertModule
 from modules.gmail_alert_runner import run_gmail_alert_loop
 from modules.intent_router import IntentRouter
 from modules.seoul_live_service import SeoulLiveService
+from modules.vision_service import VisionService
 
 from contextlib import asynccontextmanager
 
@@ -1028,14 +1028,11 @@ async def audio_websocket(ws: WebSocket):
 
     # Track state for Smart Flushing
     state = {"last_ai_write_time": 0, "flushed": False}
-    camera_state = {
-        "enabled": False,
-        "last_frame_ts": 0.0,
-        "frames_sent": 0,
-        "latest_snapshot": None,
-        "snapshot_ts": 0.0,
-        "snapshot_updates": 0,
-    }
+    vision_service = VisionService(
+        min_interval_sec=CAMERA_FRAME_MIN_INTERVAL_SEC,
+        snapshot_ttl_sec=VISION_SNAPSHOT_TTL_SEC,
+        log=print,
+    )
     dynamic_contexts = []
     dynamic_context_lock = asyncio.Lock()
     session_ref = {"obj": None}
@@ -1134,33 +1131,6 @@ async def audio_websocket(ws: WebSocket):
         except Exception as e:
             print(f"[SeoulInfo] initial location context injection failed: {e}")
 
-    async def _send_camera_frame_to_gemini(image_bytes: bytes, mime_type: str = "image/jpeg"):
-        if not image_bytes:
-            return
-        now_ts = time.monotonic()
-        if now_ts - float(camera_state.get("last_frame_ts") or 0.0) < CAMERA_FRAME_MIN_INTERVAL_SEC:
-            return
-        session_obj = session_ref.get("obj")
-        if not session_obj:
-            return
-        try:
-            await session_obj.send_realtime_input(
-                media={"data": image_bytes, "mime_type": mime_type}
-            )
-            camera_state["last_frame_ts"] = now_ts
-            camera_state["frames_sent"] = int(camera_state.get("frames_sent") or 0) + 1
-            frames = int(camera_state["frames_sent"])
-            if frames == 1:
-                await _inject_live_context_now(
-                    "[VISION] Camera is on and at least one live frame has been received. "
-                    "You can answer questions about what is visible in the current scene.",
-                    complete_turn=False,
-                )
-            if frames % 5 == 0:
-                print(f"[Vision] camera frames sent to Gemini: {frames}")
-        except Exception as e:
-            print(f"[Vision] camera frame send failed: {e}")
-
     async def _save_home_destination(new_home_destination: str):
         dest = str(new_home_destination or "").strip()
         if not dest:
@@ -1208,16 +1178,18 @@ async def audio_websocket(ws: WebSocket):
             if role == "user":
                 try:
                     user_activity["last_user_ts"] = time.monotonic()
-                    if _is_vision_related_query(text):
-                        snapshot_bytes = camera_state.get("latest_snapshot")
-                        snapshot_ts = float(camera_state.get("snapshot_ts") or 0.0)
-                        if (
-                            isinstance(snapshot_bytes, (bytes, bytearray))
-                            and (time.monotonic() - snapshot_ts) <= VISION_SNAPSHOT_TTL_SEC
-                            and loop.is_running()
-                        ):
+                    snapshot_bytes = vision_service.get_recent_snapshot_for_query(
+                        text,
+                        _is_vision_related_query,
+                    )
+                    if snapshot_bytes and loop.is_running():
                             asyncio.run_coroutine_threadsafe(
-                                _send_camera_frame_to_gemini(bytes(snapshot_bytes), mime_type="image/jpeg"),
+                                vision_service.send_frame_to_gemini(
+                                    session_ref=session_ref,
+                                    inject_live_context_now=_inject_live_context_now,
+                                    image_bytes=snapshot_bytes,
+                                    mime_type="image/jpeg",
+                                ),
                                 loop,
                             )
                             asyncio.run_coroutine_threadsafe(
@@ -1463,42 +1435,22 @@ async def audio_websocket(ws: WebSocket):
                                         if moved_m is None or moved_m >= 80:
                                             asyncio.create_task(_preload_env_cache(force=False))
                                 elif isinstance(payload, dict) and payload.get("type") == "camera_state":
-                                    camera_on = bool(payload.get("enabled"))
-                                    camera_state["enabled"] = camera_on
-                                    if not camera_on:
-                                        camera_state["frames_sent"] = 0
-                                        camera_state["snapshot_updates"] = 0
-                                    print(f"[Vision] Camera state changed: enabled={camera_on}")
-                                    if camera_on:
-                                        await _inject_live_context_now(
-                                            "[VISION] Camera has been turned on. Wait for incoming frame context and use it with voice.",
-                                            complete_turn=False,
-                                        )
+                                    await vision_service.set_camera_enabled(
+                                        enabled=bool(payload.get("enabled")),
+                                        inject_live_context_now=_inject_live_context_now,
+                                    )
                                 elif isinstance(payload, dict) and payload.get("type") == "camera_frame_base64":
-                                    if camera_state.get("enabled"):
-                                        b64 = payload.get("data")
-                                        mime_type = str(payload.get("mime_type") or "image/jpeg")
-                                        if isinstance(b64, str) and b64:
-                                            try:
-                                                image_bytes = base64.b64decode(b64)
-                                                await _send_camera_frame_to_gemini(image_bytes, mime_type=mime_type)
-                                            except Exception as e:
-                                                print(f"[Vision] camera frame decode failed: {e}")
+                                    await vision_service.handle_camera_frame_payload(
+                                        payload=payload,
+                                        session_ref=session_ref,
+                                        inject_live_context_now=_inject_live_context_now,
+                                    )
                                 elif isinstance(payload, dict) and payload.get("type") == "camera_snapshot_base64":
-                                    if camera_state.get("enabled"):
-                                        b64 = payload.get("data")
-                                        if isinstance(b64, str) and b64:
-                                            try:
-                                                image_bytes = base64.b64decode(b64)
-                                                camera_state["latest_snapshot"] = image_bytes
-                                                camera_state["snapshot_ts"] = time.monotonic()
-                                                camera_state["snapshot_updates"] = int(camera_state.get("snapshot_updates") or 0) + 1
-                                                updates = int(camera_state["snapshot_updates"])
-                                                if updates == 1 or updates % 20 == 0:
-                                                    print(f"[Vision] snapshot updated x{updates}")
-                                                await _send_camera_frame_to_gemini(image_bytes, mime_type="image/jpeg")
-                                            except Exception as e:
-                                                print(f"[Vision] snapshot decode failed: {e}")
+                                    await vision_service.handle_camera_snapshot_payload(
+                                        payload=payload,
+                                        session_ref=session_ref,
+                                        inject_live_context_now=_inject_live_context_now,
+                                    )
                             except Exception:
                                 pass
                             continue
