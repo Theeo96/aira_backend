@@ -44,3 +44,4 @@ refer/
 Output/
 .gradio/
 *.pem
+backend/modules/gmail_alert_state.json
