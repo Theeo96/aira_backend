@@ -1944,3 +1944,23 @@
 
 ### 영향
 - `start_services.bat -> backend/run_server.py -> backend/server.py` 실행 경로에는 영향 없음.
+
+## 2026-02-15 - server.py 정리 2차 (IntentRouter 모듈 분리)
+- 브랜치: `mun-cleanup-server`
+- 목적: `server.py` 충돌 지점을 줄이기 위해 의도 라우팅 클래스를 `modules`로 분리.
+
+### 변경 내용
+- 추가: `backend/modules/intent_router.py`
+  - `IntentRouter` 클래스 이동
+  - Azure OpenAI 초기화/LLM 라우팅/fallback 로직 포함
+  - destination 추출 함수는 콜백 주입 방식으로 의존성 분리
+
+- 수정: `backend/server.py`
+  - 인라인 `IntentRouter` 클래스 삭제
+  - `from modules.intent_router import IntentRouter`로 교체
+  - `_extract_destination_from_text` 정의 이후 `intent_router` 인스턴스 생성하도록 변경
+  - 불필요해진 `AzureOpenAI` 직접 import 제거
+
+### 영향
+- 기능 동작은 동일 유지
+- `server.py` 상단 대형 클래스 블록 제거로 충돌면적 축소

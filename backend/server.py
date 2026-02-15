@@ -20,12 +20,12 @@ import sys
 import urllib.parse
 import urllib.request
 import urllib.error
-from openai import AzureOpenAI
 from modules.cosmos_db import cosmos_service
 from modules.memory import memory_service
 from modules.seoul_info_module import build_seoul_info_packet, build_speech_summary
 from modules.news_agent import NewsAgent
 from modules.gmail_alert_module import GmailAlertModule
+from modules.intent_router import IntentRouter
 
 from contextlib import asynccontextmanager
 
@@ -90,79 +90,7 @@ except Exception as e:
     print(f"[GmailAlert] init failed: {e}")
 
 
-class IntentRouter:
-    def __init__(self):
-        self.client = None
-        if not AZURE_OPENAI_API_KEY or not AZURE_OPENAI_ENDPOINT:
-            print("[IntentRouter] Azure OpenAI credentials missing. Fallback routing only.")
-            return
-        base_endpoint = AZURE_OPENAI_ENDPOINT
-        if "/openai/v1" in base_endpoint:
-            base_endpoint = base_endpoint.split("/openai/v1")[0]
-        try:
-            self.client = AzureOpenAI(
-                api_key=AZURE_OPENAI_API_KEY,
-                api_version=AZURE_OPENAI_API_VERSION,
-                azure_endpoint=base_endpoint,
-                timeout=4.0,
-            )
-            print("[IntentRouter] Azure OpenAI router initialized.")
-        except Exception as e:
-            print(f"[IntentRouter] init failed: {e}")
-            self.client = None
-
-    def _fallback(self, text: str):
-        t = str(text or "")
-        if any(k in t for k in ["뉴스", "헤드라인", "속보", "기사"]):
-            return {"intent": "news", "destination": _extract_destination_from_text(t), "source": "fallback", "home_update": False}
-        if any(k in t for k in ["지하철", "역", "방면", "열차", "몇 분"]):
-            return {"intent": "subway_route", "destination": _extract_destination_from_text(t), "source": "fallback", "home_update": False}
-        if any(k in t for k in ["버스", "정류장"]):
-            return {"intent": "bus_route", "destination": _extract_destination_from_text(t), "source": "fallback", "home_update": False}
-        if any(k in t for k in ["날씨", "비", "기온"]):
-            return {"intent": "weather", "destination": _extract_destination_from_text(t), "source": "fallback", "home_update": False}
-        if any(k in t for k in ["대기질", "미세먼지", "aqi"]):
-            return {"intent": "air_quality", "destination": _extract_destination_from_text(t), "source": "fallback", "home_update": False}
-        return {"intent": "commute_overview", "destination": _extract_destination_from_text(t), "source": "fallback", "home_update": False}
-
-    def route(self, text: str):
-        if not self.client:
-            return self._fallback(text)
-        system = (
-            "Classify Korean commuter query intent. Return JSON only with keys: "
-            "intent, destination, home_update. intent one of "
-            "[subway_route,bus_route,weather,air_quality,news,commute_overview,general]. "
-            "destination should be a concise place/station name or null. "
-            "home_update must be true only when the user explicitly indicates home relocation/change "
-            "(e.g., moved house, changed home location, says 'my home is now ...'). "
-            "If user is just asking route to another place (friend's home, visit, outing), home_update must be false."
-        )
-        try:
-            resp = self.client.chat.completions.create(
-                model=INTENT_ROUTER_MODEL,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": str(text or "")},
-                ],
-            )
-            content = resp.choices[0].message.content
-            data = json.loads(content) if content else {}
-            intent = data.get("intent") if isinstance(data, dict) else None
-            destination = data.get("destination") if isinstance(data, dict) else None
-            home_update = bool(data.get("home_update")) if isinstance(data, dict) else False
-            if intent not in {"subway_route", "bus_route", "weather", "air_quality", "news", "commute_overview", "general"}:
-                return self._fallback(text)
-            return {"intent": intent, "destination": destination, "source": "llm", "home_update": home_update}
-        except Exception as e:
-            print(f"[IntentRouter] route failed: {e}")
-            if "DeploymentNotFound" in str(e):
-                print("[IntentRouter] Disabling Azure router due to missing deployment. Using fallback routing.")
-                self.client = None
-            return self._fallback(text)
-
-
-intent_router = IntentRouter()
+intent_router = None
 
 
 def _http_get_json(url: str, timeout: int = 6):
@@ -228,6 +156,15 @@ def _extract_destination_from_text(text: str):
         if cand:
             return cand
     return None
+
+
+intent_router = IntentRouter(
+    api_key=AZURE_OPENAI_API_KEY,
+    endpoint=AZURE_OPENAI_ENDPOINT,
+    api_version=AZURE_OPENAI_API_VERSION,
+    model=INTENT_ROUTER_MODEL,
+    destination_extractor=_extract_destination_from_text,
+)
 
 
 def _extract_news_topic_from_text(text: str):
