@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect, useCallback } from "react";
-import { Mic, MicOff } from "lucide-react";
+import { Camera, CameraOff, Mic, MicOff, Monitor, MonitorOff } from "lucide-react";
 
 type TranscriptMessage = {
   role: "user" | "ai";
@@ -11,6 +11,8 @@ type TranscriptMessage = {
 export default function Home() {
   const [isConnected, setIsConnected] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
+  const [isCameraOn, setIsCameraOn] = useState(false);
+  const [isScreenOn, setIsScreenOn] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
   const [status, setStatus] = useState("Disconnected");
   const [transcripts, setTranscripts] = useState<TranscriptMessage[]>([]);
@@ -24,6 +26,13 @@ export default function Home() {
   const playbackContextRef = useRef<AudioContext | null>(null);
   const nextStartTimeRef = useRef<number>(0);
   const chatBottomRef = useRef<HTMLDivElement>(null);
+  const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
+  const cameraCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const cameraStreamRef = useRef<MediaStream | null>(null);
+  const screenStreamRef = useRef<MediaStream | null>(null);
+  const aiSpeakingRef = useRef<boolean>(false);
+  const aiSpeakingTimerRef = useRef<number | null>(null);
+  const visionHeartbeatTimerRef = useRef<number | null>(null);
 
   // Initialize Audio Context & Cleanup
   useEffect(() => {
@@ -33,6 +42,16 @@ export default function Home() {
 
     return () => {
       clearLocationTimer();
+      stopCameraProcessing();
+      stopScreenProcessing();
+      if (visionHeartbeatTimerRef.current) {
+        window.clearInterval(visionHeartbeatTimerRef.current);
+        visionHeartbeatTimerRef.current = null;
+      }
+      if (aiSpeakingTimerRef.current) {
+        window.clearTimeout(aiSpeakingTimerRef.current);
+        aiSpeakingTimerRef.current = null;
+      }
       if (websocketRef.current) websocketRef.current.close();
       stopAudioProcessing();
     };
@@ -54,6 +73,8 @@ export default function Home() {
   };
 
   const handleLogout = () => {
+    stopCameraProcessing();
+    stopScreenProcessing();
     setUserToken(null);
     localStorage.removeItem("google_user_token");
     if (websocketRef.current) websocketRef.current.close();
@@ -63,6 +84,35 @@ export default function Home() {
 
   const openGoogleLogin = () => {
     window.open("https://8ai-th-loginback-atcyfgfcgbfxcvhx.koreacentral-01.azurewebsites.net/login", "_blank");
+  };
+
+  const markAiSpeaking = () => {
+    aiSpeakingRef.current = true;
+    if (aiSpeakingTimerRef.current) {
+      window.clearTimeout(aiSpeakingTimerRef.current);
+      aiSpeakingTimerRef.current = null;
+    }
+    aiSpeakingTimerRef.current = window.setTimeout(() => {
+      aiSpeakingRef.current = false;
+      aiSpeakingTimerRef.current = null;
+    }, 900);
+  };
+
+  const resampleTo16k = (input: Float32Array, inputRate: number): Float32Array => {
+    const targetRate = 16000;
+    if (!input || input.length === 0) return new Float32Array(0);
+    if (!inputRate || inputRate <= 0 || inputRate === targetRate) return input;
+    const ratio = inputRate / targetRate;
+    const outputLength = Math.max(1, Math.floor(input.length / ratio));
+    const output = new Float32Array(outputLength);
+    for (let i = 0; i < outputLength; i++) {
+      const srcIndex = i * ratio;
+      const idx = Math.floor(srcIndex);
+      const next = Math.min(idx + 1, input.length - 1);
+      const frac = srcIndex - idx;
+      output[i] = input[idx] * (1 - frac) + input[next] * frac;
+    }
+    return output;
   };
 
   const clearLocationTimer = () => {
@@ -156,6 +206,8 @@ export default function Home() {
       if (websocketRef.current !== ws) return;
       websocketRef.current = null;
       clearLocationTimer();
+      stopCameraProcessing();
+      stopScreenProcessing();
       stopAudioProcessing();
       setIsConnected(false);
       setIsConnecting(false);
@@ -166,6 +218,8 @@ export default function Home() {
       if (websocketRef.current !== ws) return;
       websocketRef.current = null;
       clearLocationTimer();
+      stopCameraProcessing();
+      stopScreenProcessing();
       stopAudioProcessing();
       setIsConnected(false);
       setIsConnecting(false);
@@ -177,6 +231,7 @@ export default function Home() {
       if (event.data instanceof Blob) {
         // Audio Data
         const arrayBuffer = await event.data.arrayBuffer();
+        markAiSpeaking();
         playAudioChunk(arrayBuffer);
       } else {
         // Text Data (JSON Transcript)
@@ -224,6 +279,156 @@ export default function Home() {
   const inputContextRef = useRef<AudioContext | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
 
+  const stopCameraProcessing = () => {
+    if (visionHeartbeatTimerRef.current) {
+      window.clearInterval(visionHeartbeatTimerRef.current);
+      visionHeartbeatTimerRef.current = null;
+    }
+    if (cameraStreamRef.current) {
+      cameraStreamRef.current.getTracks().forEach((t) => t.stop());
+      cameraStreamRef.current = null;
+    }
+    if (cameraVideoRef.current) {
+      cameraVideoRef.current.srcObject = null;
+    }
+    setIsCameraOn(false);
+    if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
+      websocketRef.current.send(JSON.stringify({ type: "camera_state", enabled: false }));
+    }
+  };
+
+  const stopScreenProcessing = () => {
+    if (visionHeartbeatTimerRef.current) {
+      window.clearInterval(visionHeartbeatTimerRef.current);
+      visionHeartbeatTimerRef.current = null;
+    }
+    if (screenStreamRef.current) {
+      screenStreamRef.current.getTracks().forEach((t) => t.stop());
+      screenStreamRef.current = null;
+    }
+    setIsScreenOn(false);
+    if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
+      websocketRef.current.send(JSON.stringify({ type: "camera_state", enabled: false }));
+    }
+  };
+
+  const sendVisionSnapshot = () => {
+    const ws = websocketRef.current;
+    const v = cameraVideoRef.current;
+    const c = cameraCanvasRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN || !v || !c) return;
+    if (v.videoWidth === 0 || v.videoHeight === 0) return;
+
+    c.width = 640;
+    c.height = Math.max(360, Math.floor((640 * v.videoHeight) / v.videoWidth));
+    const ctx = c.getContext("2d");
+    if (!ctx) return;
+    ctx.drawImage(v, 0, 0, c.width, c.height);
+    const dataUrl = c.toDataURL("image/jpeg", 0.55);
+    const b64 = dataUrl.split(",")[1] || "";
+    if (!b64) return;
+    ws.send(
+      JSON.stringify({
+        type: "camera_snapshot_base64",
+        mime_type: "image/jpeg",
+        data: b64,
+      })
+    );
+    return true;
+  };
+
+  const sendVisionSnapshotWithRetry = (attempt = 0) => {
+    const ok = sendVisionSnapshot();
+    if (ok) return;
+    if (attempt >= 20) return;
+    window.setTimeout(() => {
+      sendVisionSnapshotWithRetry(attempt + 1);
+    }, 250);
+  };
+
+  const startVisionHeartbeat = () => {
+    if (visionHeartbeatTimerRef.current) {
+      window.clearInterval(visionHeartbeatTimerRef.current);
+      visionHeartbeatTimerRef.current = null;
+    }
+    visionHeartbeatTimerRef.current = window.setInterval(() => {
+      sendVisionSnapshotWithRetry();
+    }, 1200);
+  };
+
+  const startCameraProcessing = async () => {
+    if (!websocketRef.current || websocketRef.current.readyState !== WebSocket.OPEN) {
+      setStatus("Connect first");
+      return;
+    }
+    if (isCameraOn) return;
+    try {
+      if (isScreenOn) stopScreenProcessing();
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: "environment",
+          width: { ideal: 960 },
+          height: { ideal: 540 },
+        },
+        audio: false,
+      });
+      cameraStreamRef.current = stream;
+      const video = cameraVideoRef.current;
+      if (video) {
+        video.srcObject = stream;
+        await video.play();
+      }
+
+      websocketRef.current.send(JSON.stringify({ type: "camera_state", enabled: true }));
+      setIsCameraOn(true);
+      setIsScreenOn(false);
+      sendVisionSnapshotWithRetry();
+      startVisionHeartbeat();
+    } catch (e) {
+      console.error(e);
+      setStatus("Camera Error");
+      stopCameraProcessing();
+    }
+  };
+
+  const startScreenProcessing = async () => {
+    if (!websocketRef.current || websocketRef.current.readyState !== WebSocket.OPEN) {
+      setStatus("Connect first");
+      return;
+    }
+    if (isScreenOn) return;
+    try {
+      if (isCameraOn) stopCameraProcessing();
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: 8 },
+        audio: false,
+      });
+      screenStreamRef.current = stream;
+      const video = cameraVideoRef.current;
+      if (video) {
+        video.srcObject = stream;
+        await video.play();
+      }
+
+      websocketRef.current.send(JSON.stringify({ type: "camera_state", enabled: true }));
+      setIsScreenOn(true);
+      setIsCameraOn(false);
+      sendVisionSnapshotWithRetry();
+      startVisionHeartbeat();
+
+      const [track] = stream.getVideoTracks();
+      if (track) {
+        track.onended = () => {
+          stopScreenProcessing();
+        };
+      }
+    } catch (e) {
+      console.error(e);
+      setStatus("Screen Share Error");
+      stopScreenProcessing();
+    }
+  };
+
   const startAudioProcessing = async () => {
     if (!websocketRef.current || websocketRef.current.readyState !== WebSocket.OPEN) {
       setStatus("Connect first");
@@ -232,24 +437,28 @@ export default function Home() {
     if (isRecording) return;
     try {
       await sendLocationUpdate(websocketRef.current);
+      if (!aiSpeakingRef.current) {
+        sendVisionSnapshotWithRetry();
+      }
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
       });
       micStreamRef.current = stream;
-      inputContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      inputContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
       const ctx = inputContextRef.current;
       if (ctx.state === "suspended") {
         await ctx.resume();
       }
       sourceRef.current = ctx.createMediaStreamSource(stream);
-      processorRef.current = ctx.createScriptProcessor(4096, 1, 1);
+      processorRef.current = ctx.createScriptProcessor(2048, 1, 1);
 
       processorRef.current.onaudioprocess = (e) => {
         if (!websocketRef.current || websocketRef.current.readyState !== WebSocket.OPEN) return;
         const inputData = e.inputBuffer.getChannelData(0);
-        const pcmData = new Int16Array(inputData.length);
-        for (let i = 0; i < inputData.length; i++) {
-          const s = Math.max(-1, Math.min(1, inputData[i]));
+        const resampled = resampleTo16k(inputData, ctx.sampleRate);
+        const pcmData = new Int16Array(resampled.length);
+        for (let i = 0; i < resampled.length; i++) {
+          const s = Math.max(-1, Math.min(1, resampled[i]));
           pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
         }
         websocketRef.current.send(pcmData.buffer);
@@ -278,6 +487,22 @@ export default function Home() {
     inputContextRef.current = null;
     setIsRecording(false);
     if (isConnected) setStatus("Idle");
+  };
+
+  const toggleCamera = () => {
+    if (isCameraOn) {
+      stopCameraProcessing();
+      return;
+    }
+    startCameraProcessing();
+  };
+
+  const toggleScreenShare = () => {
+    if (isScreenOn) {
+      stopScreenProcessing();
+      return;
+    }
+    startScreenProcessing();
   };
 
   if (!userToken) {
@@ -319,8 +544,8 @@ export default function Home() {
 
   return (
     <main className="flex min-h-screen flex-col items-center justify-between p-8 bg-black text-white">
-      {/* Header & Status - Wider (max-w-4xl) */}
-      <div className="z-10 w-full max-w-4xl items-center justify-between font-mono text-sm flex flex-col gap-4">
+      {/* Header & Status */}
+      <div className="z-10 w-full max-w-5xl items-center justify-between font-mono text-sm flex flex-col gap-4">
         <div className="w-full flex justify-between items-center">
           <h1 className="text-2xl font-bold bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent">
             Aira Real-time
@@ -335,8 +560,8 @@ export default function Home() {
         </div>
       </div>
 
-      {/* Mic Control - Wider (max-w-4xl) */}
-      <div className="flex-1 flex flex-col items-center justify-center gap-8 w-full max-w-4xl">
+      {/* Mic + Camera */}
+      <div className="flex-1 flex flex-col items-center justify-center gap-8 w-full max-w-6xl">
         <div className={`relative w-48 h-48 rounded-full flex items-center justify-center transition-all duration-300 ${isRecording ? "bg-red-900/20 shadow-[0_0_50px_rgba(220,38,38,0.5)]" : "bg-gray-800"}`}>
           {isRecording && (
             <div className="absolute inset-0 rounded-full border-4 border-red-500 opacity-20 animate-ping"></div>
@@ -362,10 +587,59 @@ export default function Home() {
             </button>
           )}
         </div>
+        <div className="w-full">
+          <button
+            onClick={toggleCamera}
+            disabled={!isConnected}
+            className={`w-full py-3 rounded-lg text-base font-bold transition ${
+              !isConnected
+                ? "bg-gray-700 cursor-not-allowed"
+                : isCameraOn
+                ? "bg-yellow-600 hover:bg-yellow-700"
+                : "bg-indigo-600 hover:bg-indigo-700"
+            }`}
+          >
+            <span className="inline-flex items-center gap-2 justify-center">
+              {isCameraOn ? <CameraOff size={18} /> : <Camera size={18} />}
+              {isCameraOn ? "Turn Camera Off" : "Turn Camera On"}
+            </span>
+          </button>
+        </div>
+        <div className="w-full">
+          <button
+            onClick={toggleScreenShare}
+            disabled={!isConnected}
+            className={`w-full py-3 rounded-lg text-base font-bold transition ${
+              !isConnected
+                ? "bg-gray-700 cursor-not-allowed"
+                : isScreenOn
+                ? "bg-rose-600 hover:bg-rose-700"
+                : "bg-cyan-600 hover:bg-cyan-700"
+            }`}
+          >
+            <span className="inline-flex items-center gap-2 justify-center">
+              {isScreenOn ? <MonitorOff size={18} /> : <Monitor size={18} />}
+              {isScreenOn ? "Stop Screen Share" : "Start Screen Share"}
+            </span>
+          </button>
+        </div>
+        <div className="w-full bg-gray-900/80 border border-gray-700 rounded-lg p-3">
+          <div className="mb-2 text-xs text-gray-400">
+            Camera: {isCameraOn ? "ON (continuous stream)" : "OFF"} | Screen: {isScreenOn ? "ON (continuous stream)" : "OFF"}
+          </div>
+          <video
+            ref={cameraVideoRef}
+            autoPlay
+            playsInline
+            muted
+            className="w-full rounded-md bg-black aspect-video min-h-[320px] md:min-h-[420px] max-h-[70vh] object-cover"
+          />
+          <canvas ref={cameraCanvasRef} className="hidden" />
+        </div>
       </div>
 
-      {/* Chat Transcript Area - Wider (max-w-4xl) & Taller (h-80) */}
-      <div className="w-full max-w-4xl mt-8 h-80 bg-gray-900 border border-gray-800 rounded-xl p-4 overflow-y-auto flex flex-col gap-3 shadow-inner">
+      {/* Chat Transcript Area */}
+      <div className="w-full max-w-5xl mt-8 h-80 bg-gray-900 border border-gray-800 rounded-xl p-4 overflow-y-auto flex flex-col gap-3 shadow-inner">
         {transcripts.length === 0 && <p className="text-gray-600 text-center text-sm py-10">대화 내용이 여기에 표시됩니다...</p>}
         {transcripts.map((msg, idx) => (
           <div key={idx} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>

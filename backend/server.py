@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import asyncio
+import base64
 import json
 import math
 import numpy as np
@@ -48,6 +49,9 @@ app.add_middleware(
 API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL_NAME = "gemini-2.5-flash-native-audio-preview-12-2025"
 GEMINI_DIRECT_AUDIO_INPUT = os.getenv("GEMINI_DIRECT_AUDIO_INPUT", "true").strip().lower() in {"1", "true", "yes", "on"}
+CAMERA_FRAME_MIN_INTERVAL_SEC = float(os.getenv("CAMERA_FRAME_MIN_INTERVAL_SEC", "1.0"))
+VISION_SNAPSHOT_TTL_SEC = float(os.getenv("VISION_SNAPSHOT_TTL_SEC", "120"))
+ENV_CACHE_TTL_SEC = float(os.getenv("ENV_CACHE_TTL_SEC", "300"))
 
 # Azure Speech Config
 AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
@@ -63,6 +67,7 @@ AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION")
 AZURE_OPENAI_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
 INTENT_ROUTER_MODEL = os.getenv("INTENT_ROUTER_MODEL") or AZURE_OPENAI_DEPLOYMENT_NAME or "gpt-4o-mini"
 ENABLE_TRANSIT_FILLER = os.getenv("ENABLE_TRANSIT_FILLER", "false").strip().lower() in {"1", "true", "yes", "on"}
+STT_SEGMENTATION_SILENCE_TIMEOUT_MS = os.getenv("STT_SEGMENTATION_SILENCE_TIMEOUT_MS", "280")
 print(f"[Config] ENABLE_TRANSIT_FILLER={ENABLE_TRANSIT_FILLER}")
 print(f"[Config] GEMINI_DIRECT_AUDIO_INPUT={GEMINI_DIRECT_AUDIO_INPUT}")
 
@@ -203,6 +208,18 @@ def _extract_destination_from_text(text: str):
         if cand:
             return cand
     return None
+
+
+def _is_vision_related_query(text: str) -> bool:
+    t = str(text or "")
+    if not t:
+        return False
+    keywords = [
+        "화면", "보여", "보이", "보여줘", "사진", "이미지", "이거", "저거",
+        "무엇", "뭐야", "무슨", "읽어", "글자", "문서", "차트", "표", "슬라이드",
+        "색", "옷", "어울려", "보이는", "scene", "screen", "image", "what do you see",
+    ]
+    return any(k in t.lower() for k in keywords)
 
 
 def _normalize_place_name(name: str | None) -> str:
@@ -541,7 +558,7 @@ def _parse_odsay_strategy(path_obj: dict):
     return strategy
 
 
-def _get_weather_and_air(lat: float, lng: float):
+def _get_weather_only(lat: float, lng: float):
     weather = {}
     w_url = (
         "https://api.open-meteo.com/v1/forecast?"
@@ -549,20 +566,39 @@ def _get_weather_and_air(lat: float, lng: float):
             {
                 "latitude": lat,
                 "longitude": lng,
-                "current": "temperature_2m,precipitation,rain",
+                "current": "temperature_2m,precipitation,rain,cloud_cover,weather_code",
+                "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+                "forecast_days": 1,
                 "timezone": "Asia/Seoul",
             }
         )
     )
     w = _http_get_json(w_url, timeout=6)
-    if isinstance(w, dict) and isinstance(w.get("current"), dict):
-        cur = w.get("current")
+    if isinstance(w, dict):
+        cur = w.get("current", {}) if isinstance(w.get("current"), dict) else {}
+        daily = w.get("daily", {}) if isinstance(w.get("daily"), dict) else {}
+        daily_max = daily.get("temperature_2m_max") if isinstance(daily.get("temperature_2m_max"), list) else []
+        daily_min = daily.get("temperature_2m_min") if isinstance(daily.get("temperature_2m_min"), list) else []
+        daily_pop = daily.get("precipitation_probability_max") if isinstance(daily.get("precipitation_probability_max"), list) else []
+        cloud_cover = _to_float(cur.get("cloud_cover"))
+        weather_code = _to_int(cur.get("weather_code"))
+        is_cloudy = (cloud_cover is not None and cloud_cover >= 60) or (weather_code in {2, 3, 45, 48} if weather_code is not None else False)
         weather = {
             "tempC": _to_float(cur.get("temperature_2m")),
             "precipitationMm": _to_float(cur.get("precipitation")),
             "rainMm": _to_float(cur.get("rain")),
+            "cloudCoverPct": cloud_cover,
+            "weatherCode": weather_code,
+            "isCloudy": bool(is_cloudy),
+            "skyText": "흐림" if is_cloudy else "대체로 맑음",
+            "todayMaxC": _to_float(daily_max[0]) if daily_max else None,
+            "todayMinC": _to_float(daily_min[0]) if daily_min else None,
+            "precipProbPct": _to_int(daily_pop[0]) if daily_pop else None,
+            "fetchedAtTs": int(time.time()),
         }
+    return weather
 
+def _get_air_only(lat: float, lng: float):
     aq_url = (
         "https://air-quality-api.open-meteo.com/v1/air-quality?"
         + urllib.parse.urlencode(
@@ -578,13 +614,48 @@ def _get_weather_and_air(lat: float, lng: float):
     air = {}
     if isinstance(aq, dict) and isinstance(aq.get("current"), dict):
         cur = aq.get("current")
+        us_aqi = _to_int(cur.get("us_aqi"))
+        grade = None
+        if us_aqi is not None:
+            if us_aqi <= 50:
+                grade = "좋음"
+            elif us_aqi <= 100:
+                grade = "보통"
+            elif us_aqi <= 150:
+                grade = "민감군 주의"
+            elif us_aqi <= 200:
+                grade = "나쁨"
+            else:
+                grade = "매우 나쁨"
         air = {
-            "usAqi": _to_int(cur.get("us_aqi")),
+            "usAqi": us_aqi,
             "pm10": _to_float(cur.get("pm10")),
             "pm25": _to_float(cur.get("pm2_5")),
+            "grade": grade,
+            "fetchedAtTs": int(time.time()),
         }
+    return air
 
+def _get_weather_and_air(lat: float, lng: float):
+    weather = _get_weather_only(lat, lng)
+    air = _get_air_only(lat, lng)
     return weather, air
+
+
+def _is_env_cache_fresh(env_cache: dict | None, lat: float | None, lng: float | None) -> bool:
+    if not isinstance(env_cache, dict):
+        return False
+    ts = float(env_cache.get("ts") or 0.0)
+    if ts <= 0:
+        return False
+    if (time.monotonic() - ts) > ENV_CACHE_TTL_SEC:
+        return False
+    cache_lat = _to_float(env_cache.get("lat"))
+    cache_lng = _to_float(env_cache.get("lng"))
+    if lat is None or lng is None or cache_lat is None or cache_lng is None:
+        return True
+    # If user moved materially, refresh cache.
+    return _haversine_meters(cache_lat, cache_lng, lat, lng) < 200
 
 
 def _build_live_seoul_summary(
@@ -816,7 +887,88 @@ def _execute_tools_for_intent(
     lat: float | None,
     lng: float | None,
     destination_name: str | None,
+    env_cache: dict | None = None,
 ):
+    # Weather/Air intents should not trigger ODSAY route/station calls.
+    if intent in {"weather", "air_quality"}:
+        weather = {}
+        air = {}
+        cache_weather = env_cache.get("weather") if isinstance(env_cache, dict) else None
+        cache_air = env_cache.get("air") if isinstance(env_cache, dict) else None
+        cache_ts = float(env_cache.get("ts") or 0.0) if isinstance(env_cache, dict) else 0.0
+        cache_fresh = _is_env_cache_fresh(env_cache, lat, lng)
+        if cache_fresh:
+            if isinstance(cache_weather, dict):
+                weather = cache_weather
+            if isinstance(cache_air, dict):
+                air = cache_air
+        elif lat is not None and lng is not None:
+            # Refresh both in one network pass so subsequent weather/air turns are instant.
+            weather, air = _get_weather_and_air(lat, lng)
+            if isinstance(env_cache, dict):
+                env_cache["weather"] = weather or {}
+                env_cache["air"] = air or {}
+                env_cache["lat"] = lat
+                env_cache["lng"] = lng
+                env_cache["ts"] = time.monotonic()
+        live = {
+            "station": None,
+            "arrivals": [],
+            "speechSummary": "",
+            "firstEtaMinutes": None,
+            "nextEtaMinutes": None,
+            "walkToStationMinutes": None,
+            "walkToBusStopMinutes": None,
+            "decision": "unknown",
+            "busStopName": None,
+            "busNumbers": [],
+            "firstMode": None,
+            "firstDirection": None,
+            "weather": weather,
+            "air": air,
+            "homeConfigured": False,
+            "destinationName": destination_name,
+            "destinationRequested": bool(destination_name),
+            "envCacheFresh": cache_fresh,
+            "envCacheTs": cache_ts,
+        }
+        parts = []
+        if intent == "weather":
+            w = live.get("weather") or {}
+            t = w.get("tempC")
+            t_max = w.get("todayMaxC")
+            t_min = w.get("todayMinC")
+            sky = w.get("skyText")
+            pop = w.get("precipProbPct")
+            rain = w.get("rainMm")
+            precip = w.get("precipitationMm")
+            if t is not None:
+                parts.append(f"현재 기온은 약 {int(round(float(t)))}도입니다.")
+            if t_max is not None and t_min is not None:
+                parts.append(f"오늘 최고/최저는 {int(round(float(t_max)))}/{int(round(float(t_min)))}도예요.")
+            if pop is not None:
+                parts.append(f"강수확률은 약 {int(pop)}%입니다.")
+            if rain is not None or precip is not None:
+                parts.append(f"강수는 현재 약 {rain or precip}mm 수준입니다.")
+            if sky:
+                parts.append(f"하늘 상태는 {sky}입니다.")
+            if not parts:
+                parts.append("날씨 데이터를 현재 받지 못했어요.")
+        else:
+            a = live.get("air") or {}
+            if a.get("usAqi") is not None:
+                parts.append(f"현재 대기질은 US AQI {a.get('usAqi')}입니다.")
+            if a.get("grade"):
+                parts.append(f"수준은 {a.get('grade')}입니다.")
+            if a.get("pm25") is not None:
+                parts.append(f"초미세먼지는 {a.get('pm25')}입니다.")
+            if a.get("pm10") is not None:
+                parts.append(f"미세먼지는 {a.get('pm10')}입니다.")
+            if not parts:
+                parts.append("대기질 데이터를 현재 받지 못했어요.")
+        live["speechSummary"] = " ".join([p for p in parts if p]).strip()
+        return live
+
     is_default_destination = (
         _normalize_place_name(destination_name) == _normalize_place_name(COMMUTE_DEFAULT_DESTINATION)
         if destination_name
@@ -889,10 +1041,11 @@ def create_push_stream(sample_rate=16000):
 def create_recognizer(audio_config, language="en-US"): # Default to English for now, or use "ko-KR"
     speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION)
     speech_config.speech_recognition_language = language
-    
-    # [Optimization] Reduce segmentation silence timeout to force faster phrase finalization
-    # Default is usually higher (e.g. 500ms-1000ms). Setting to 100ms.
-    speech_config.set_property(speechsdk.PropertyId.Speech_SegmentationSilenceTimeoutMs, "100")
+    # Too-low timeout harms Korean phrase stability. Use tunable default.
+    speech_config.set_property(
+        speechsdk.PropertyId.Speech_SegmentationSilenceTimeoutMs,
+        str(STT_SEGMENTATION_SILENCE_TIMEOUT_MS),
+    )
     
     recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
     return recognizer
@@ -952,6 +1105,7 @@ async def audio_websocket(ws: WebSocket):
         "name": saved_home_destination or COMMUTE_DEFAULT_DESTINATION,
         "asked_once": False,
     }
+    env_cache = {"weather": {}, "air": {}, "lat": current_lat, "lng": current_lng, "ts": 0.0}
 
     # Inject Memory into System Instruction
     system_instruction = (
@@ -963,7 +1117,11 @@ async def audio_websocket(ws: WebSocket):
         "For bus guidance, provide bus number, boarding stop name, and walking minutes when present in live context. "
         "Do not invent route, direction, ETA, weather, or air-quality values. "
         "Do not mention crowding/congestion unless explicit congestion data is provided in live context. "
-        "For Korean transit questions, never ask user's current location; device coordinates are already provided by server."
+        "For Korean transit questions, never ask user's current location; device coordinates are already provided by server. "
+        "If visual context is provided from camera/screen, use it naturally together with voice context. "
+        "When visual context is available, do not say phrases like '보내주신 이미지', '사진에서', "
+        "'실시간 화면을 볼 수 없다'. Refer naturally to the current screen "
+        "(e.g., '지금 화면에서 ...')."
     )
     if current_lat is not None and current_lng is not None:
         system_instruction += (
@@ -996,6 +1154,14 @@ async def audio_websocket(ws: WebSocket):
 
     # Track state for Smart Flushing
     state = {"last_ai_write_time": 0, "flushed": False}
+    camera_state = {
+        "enabled": False,
+        "last_frame_ts": 0.0,
+        "frames_sent": 0,
+        "latest_snapshot": None,
+        "snapshot_ts": 0.0,
+        "snapshot_updates": 0,
+    }
     dynamic_contexts = []
     dynamic_context_lock = asyncio.Lock()
     session_ref = {"obj": None}
@@ -1004,6 +1170,14 @@ async def audio_websocket(ws: WebSocket):
     session_transcript = []
     route_dedupe = {"text": "", "ts": 0.0}
     transit_turn_gate = {"until": 0.0}
+    response_guard = {
+        "active": False,
+        "context_sent": False,
+        "suppressed_audio_seen": False,
+        "block_direct_audio": False,
+        "block_direct_audio_until": 0.0,
+        "forced_intent_turn": None,
+    }
 
     async def _inject_live_context_now(context_text: str, complete_turn: bool = False):
         session_obj = session_ref.get("obj")
@@ -1049,6 +1223,33 @@ async def audio_websocket(ws: WebSocket):
         except Exception as e:
             print(f"[SeoulInfo] initial location context injection failed: {e}")
 
+    async def _send_camera_frame_to_gemini(image_bytes: bytes, mime_type: str = "image/jpeg"):
+        if not image_bytes:
+            return
+        now_ts = time.monotonic()
+        if now_ts - float(camera_state.get("last_frame_ts") or 0.0) < CAMERA_FRAME_MIN_INTERVAL_SEC:
+            return
+        session_obj = session_ref.get("obj")
+        if not session_obj:
+            return
+        try:
+            await session_obj.send_realtime_input(
+                media={"data": image_bytes, "mime_type": mime_type}
+            )
+            camera_state["last_frame_ts"] = now_ts
+            camera_state["frames_sent"] = int(camera_state.get("frames_sent") or 0) + 1
+            frames = int(camera_state["frames_sent"])
+            if frames == 1:
+                await _inject_live_context_now(
+                    "[VISION] Camera is on and at least one live frame has been received. "
+                    "You can answer questions about what is visible in the current scene.",
+                    complete_turn=False,
+                )
+            if frames % 5 == 0:
+                print(f"[Vision] camera frames sent to Gemini: {frames}")
+        except Exception as e:
+            print(f"[Vision] camera frame send failed: {e}")
+
     async def _save_home_destination(new_home_destination: str):
         dest = str(new_home_destination or "").strip()
         if not dest:
@@ -1062,6 +1263,28 @@ async def audio_websocket(ws: WebSocket):
         except Exception as e:
             print(f"[Profile] Failed to save home destination: {e}")
 
+    async def _preload_env_cache(force: bool = False):
+        lat = client_state.get("lat")
+        lng = client_state.get("lng")
+        if lat is None or lng is None:
+            return
+        fresh = _is_env_cache_fresh(env_cache, lat, lng)
+        if fresh and not force:
+            return
+        try:
+            weather, air = await asyncio.to_thread(_get_weather_and_air, lat, lng)
+            env_cache["weather"] = weather or {}
+            env_cache["air"] = air or {}
+            env_cache["lat"] = lat
+            env_cache["lng"] = lng
+            env_cache["ts"] = time.monotonic()
+            print(
+                f"[SeoulInfo] Env cache refreshed: "
+                f"weather={bool(env_cache['weather'])}, air={bool(env_cache['air'])}"
+            )
+        except Exception as e:
+            print(f"[SeoulInfo] Env cache refresh failed: {e}")
+
     # STT Event Handlers
     def on_recognized(args, role):
         if args.result.text:
@@ -1073,7 +1296,28 @@ async def audio_websocket(ws: WebSocket):
 
             if role == "user":
                 try:
-                    normalized_user_text = re.sub(r"\s+", "", str(text or ""))
+                    if _is_vision_related_query(text):
+                        snapshot_bytes = camera_state.get("latest_snapshot")
+                        snapshot_ts = float(camera_state.get("snapshot_ts") or 0.0)
+                        if (
+                            isinstance(snapshot_bytes, (bytes, bytearray))
+                            and (time.monotonic() - snapshot_ts) <= VISION_SNAPSHOT_TTL_SEC
+                            and loop.is_running()
+                        ):
+                            asyncio.run_coroutine_threadsafe(
+                                _send_camera_frame_to_gemini(bytes(snapshot_bytes), mime_type="image/jpeg"),
+                                loop,
+                            )
+                            asyncio.run_coroutine_threadsafe(
+                                _inject_live_context_now(
+                                    "[VISION] Recent visual context is available for this turn. "
+                                    "Use visual context if relevant.",
+                                    complete_turn=False,
+                                ),
+                                loop,
+                            )
+
+                    normalized_user_text = re.sub(r"[\s\W_]+", "", str(text or ""))
                     now_ts = time.monotonic()
                     # Azure STT can emit near-duplicate finalized chunks; skip fast duplicates.
                     if (
@@ -1129,6 +1373,22 @@ async def audio_websocket(ws: WebSocket):
                     should_inject_live = intent in routing_intents
 
                     if should_inject_live:
+                        env_intent = intent in {"weather", "air_quality"}
+                        # Always gate response until live context is injected to prevent pre-context utterances.
+                        response_guard["active"] = True
+                        response_guard["context_sent"] = False
+                        response_guard["suppressed_audio_seen"] = False
+                        response_guard["block_direct_audio"] = True
+                        response_guard["block_direct_audio_until"] = time.monotonic() + (5.0 if env_intent else 4.0)
+                        response_guard["forced_intent_turn"] = intent
+                        # Transit intents keep output gate. Env intents should speak filler immediately.
+                        if not env_intent:
+                            transit_turn_gate["until"] = max(
+                                float(transit_turn_gate.get("until") or 0.0),
+                                time.monotonic() + 1.2,
+                            )
+                        else:
+                            transit_turn_gate["until"] = time.monotonic()
                         if client_state.get("lat") is not None and client_state.get("lng") is not None and loop.is_running():
                             asyncio.run_coroutine_threadsafe(
                                 _inject_live_context_now(
@@ -1158,29 +1418,31 @@ async def audio_websocket(ws: WebSocket):
                                 _inject_live_context_now(filler_text, complete_turn=True),
                                 loop,
                             )
-
+                        transit_intents = {"subway_route", "bus_route", "commute_overview"}
+                        context_destination = destination_state["name"] if intent in transit_intents else None
                         live_data = _execute_tools_for_intent(
                             intent=intent or "commute_overview",
                             lat=client_state.get("lat"),
                             lng=client_state.get("lng"),
-                            destination_name=destination_state["name"],
+                            destination_name=context_destination,
+                            env_cache=env_cache,
                         )
                         live_summary = live_data.get("speechSummary") if isinstance(live_data, dict) else None
                         print(
-                            f"[SeoulInfo] live context built: intent={intent}, destination={destination_state.get('name')}, "
+                            f"[SeoulInfo] live context built: intent={intent}, destination={context_destination}, "
                             f"summary_ok={bool(live_summary)}"
                         )
 
                         guidance = []
                         if client_state.get("lat") is not None and client_state.get("lng") is not None:
                             guidance.append("Location is known; do not ask user's current location.")
-                        if destination_state.get("name"):
+                        if intent in transit_intents and destination_state.get("name"):
                             guidance.append(
                                 f"Use destination '{destination_state['name']}' for this turn and ignore older destination context."
                             )
                         if (
                             not destination_state.get("name")
-                            and intent in {"subway_route", "bus_route", "commute_overview"}
+                            and intent in transit_intents
                         ):
                             if not destination_state.get("asked_once", False):
                                 guidance.append("Ask destination exactly once in one short question.")
@@ -1200,7 +1462,8 @@ async def audio_websocket(ws: WebSocket):
                         ctx_text = f"[INTENT:{intent or 'commute_overview'}] {str(live_summary)}"
                         if guidance:
                             ctx_text += " [GUIDE] " + " ".join(guidance)
-                        if intent in {"subway_route", "bus_route", "commute_overview"}:
+                        context_priority_intents = {"subway_route", "bus_route", "commute_overview", "weather", "air_quality"}
+                        if intent in context_priority_intents:
                             ctx_text += (
                                 " [ACTION] Respond to the user's latest request now using this context. "
                                 "Give one concise final answer only. "
@@ -1208,17 +1471,21 @@ async def audio_websocket(ws: WebSocket):
                                 "Do not say you cannot provide realtime data unless the provided summary explicitly says data is missing. "
                                 "If summary exists, prioritize it and answer directly from it."
                             )
-                            # Temporarily gate direct audio input so context turn is processed first.
-                            transit_turn_gate["until"] = time.monotonic() + 2.5
+                            # Keep gate a little longer while response turn is being finalized.
+                            transit_turn_gate["until"] = max(
+                                float(transit_turn_gate.get("until") or 0.0),
+                                time.monotonic() + 0.8,
+                            )
 
                         if loop.is_running():
                             asyncio.run_coroutine_threadsafe(
                                 _inject_live_context_now(
                                     ctx_text,
-                                    complete_turn=intent in {"subway_route", "bus_route", "commute_overview"},
+                                    complete_turn=intent in context_priority_intents,
                                 ),
                                 loop,
                             )
+                            response_guard["context_sent"] = True
                     else:
                         # Text-only path for non-routing/general turns when direct audio is disabled.
                         if (not GEMINI_DIRECT_AUDIO_INPUT) and loop.is_running():
@@ -1244,6 +1511,7 @@ async def audio_websocket(ws: WebSocket):
         async with client.aio.live.connect(model=MODEL_NAME, config=config) as session:
             print("[Gemini] Connected to Live API")
             session_ref["obj"] = session
+            await _preload_env_cache(force=True)
             await _inject_initial_location_context()
             state["last_ai_write_time"] = asyncio.get_running_loop().time()
             
@@ -1278,6 +1546,46 @@ async def audio_websocket(ws: WebSocket):
                                             print(f"[SeoulInfo] Location updated lat={new_lat}, lng={new_lng}")
                                             client_state["last_log_lat"] = new_lat
                                             client_state["last_log_lng"] = new_lng
+                                        # Refresh cached weather/air in background when movement is meaningful.
+                                        if moved_m is None or moved_m >= 80:
+                                            asyncio.create_task(_preload_env_cache(force=False))
+                                elif isinstance(payload, dict) and payload.get("type") == "camera_state":
+                                    camera_on = bool(payload.get("enabled"))
+                                    camera_state["enabled"] = camera_on
+                                    if not camera_on:
+                                        camera_state["frames_sent"] = 0
+                                        camera_state["snapshot_updates"] = 0
+                                    print(f"[Vision] Camera state changed: enabled={camera_on}")
+                                    if camera_on:
+                                        await _inject_live_context_now(
+                                            "[VISION] Camera has been turned on. Wait for incoming frame context and use it with voice.",
+                                            complete_turn=False,
+                                        )
+                                elif isinstance(payload, dict) and payload.get("type") == "camera_frame_base64":
+                                    if camera_state.get("enabled"):
+                                        b64 = payload.get("data")
+                                        mime_type = str(payload.get("mime_type") or "image/jpeg")
+                                        if isinstance(b64, str) and b64:
+                                            try:
+                                                image_bytes = base64.b64decode(b64)
+                                                await _send_camera_frame_to_gemini(image_bytes, mime_type=mime_type)
+                                            except Exception as e:
+                                                print(f"[Vision] camera frame decode failed: {e}")
+                                elif isinstance(payload, dict) and payload.get("type") == "camera_snapshot_base64":
+                                    if camera_state.get("enabled"):
+                                        b64 = payload.get("data")
+                                        if isinstance(b64, str) and b64:
+                                            try:
+                                                image_bytes = base64.b64decode(b64)
+                                                camera_state["latest_snapshot"] = image_bytes
+                                                camera_state["snapshot_ts"] = time.monotonic()
+                                                camera_state["snapshot_updates"] = int(camera_state.get("snapshot_updates") or 0) + 1
+                                                updates = int(camera_state["snapshot_updates"])
+                                                if updates == 1 or updates % 20 == 0:
+                                                    print(f"[Vision] snapshot updated x{updates}")
+                                                await _send_camera_frame_to_gemini(image_bytes, mime_type="image/jpeg")
+                                            except Exception as e:
+                                                print(f"[Vision] snapshot decode failed: {e}")
                             except Exception:
                                 pass
                             continue
@@ -1312,9 +1620,20 @@ async def audio_websocket(ws: WebSocket):
                                     ],
                                     turn_complete=False,
                                 )
+                                # Live context was pushed; release output/input gate quickly
+                                # so user does not feel unnecessary latency.
+                                transit_turn_gate["until"] = min(
+                                    float(transit_turn_gate.get("until") or 0.0),
+                                    time.monotonic() + 0.15,
+                                )
                             except Exception as e:
                                 print(f"[SeoulInfo] context injection failed: {e}")
-                        if GEMINI_DIRECT_AUDIO_INPUT and time.monotonic() >= float(transit_turn_gate.get("until") or 0.0):
+                        if (
+                            GEMINI_DIRECT_AUDIO_INPUT
+                            and (not response_guard.get("block_direct_audio"))
+                            and time.monotonic() >= float(response_guard.get("block_direct_audio_until") or 0.0)
+                            and time.monotonic() >= float(transit_turn_gate.get("until") or 0.0)
+                        ):
                             await session.send_realtime_input(audio={"data": data, "mime_type": "audio/pcm;rate=16000"})
                         # [Fix] Pushing to Azure Stream might block if internal buffer is full. Offload to thread.
                         await asyncio.to_thread(user_push_stream.write, data)
@@ -1332,6 +1651,23 @@ async def audio_websocket(ws: WebSocket):
                                 for part in response.server_content.model_turn.parts:
                                     if part.inline_data:
                                         audio_bytes = part.inline_data.data
+                                        # Suppress premature model audio while live-context turn is being prepared.
+                                        if time.monotonic() < float(transit_turn_gate.get("until") or 0.0):
+                                            if response_guard.get("active"):
+                                                response_guard["suppressed_audio_seen"] = True
+                                            continue
+                                        # Drop any model audio before live context is sent for this guarded turn.
+                                        if response_guard.get("active") and (not response_guard.get("context_sent")):
+                                            response_guard["suppressed_audio_seen"] = True
+                                            continue
+                                        # If we already saw suppressed audio before context turn was ready,
+                                        # keep dropping until the stale turn completes.
+                                        if (
+                                            response_guard.get("active")
+                                            and response_guard.get("context_sent")
+                                            and response_guard.get("suppressed_audio_seen")
+                                        ):
+                                            continue
                                         await ws.send_bytes(audio_bytes)
                                         # [Fix] Offload AI audio write to thread
                                         await asyncio.to_thread(ai_push_stream.write, audio_bytes)
@@ -1341,7 +1677,23 @@ async def audio_websocket(ws: WebSocket):
                             
                             # [Fix 3] Monitor Gemini Turn Complete
                             if response.server_content and response.server_content.turn_complete:
-                                pass
+                                if (
+                                    response_guard.get("active")
+                                    and response_guard.get("context_sent")
+                                    and response_guard.get("suppressed_audio_seen")
+                                ):
+                                    # Stale pre-context turn ended; allow the next turn through.
+                                    response_guard["suppressed_audio_seen"] = False
+                                    response_guard["active"] = False
+                                    response_guard["block_direct_audio"] = False
+                                    response_guard["block_direct_audio_until"] = 0.0
+                                    response_guard["forced_intent_turn"] = None
+                                elif response_guard.get("active") and response_guard.get("context_sent"):
+                                    # No stale audio detected; normal guarded turn complete.
+                                    response_guard["active"] = False
+                                    response_guard["block_direct_audio"] = False
+                                    response_guard["block_direct_audio_until"] = 0.0
+                                    response_guard["forced_intent_turn"] = None
 
                 except Exception as e:
                     print(f"[Server] Error processing output: {e}")

@@ -1094,3 +1094,713 @@
 ### 기대 효과
 - 올바른 경로 요약이 먼저/단일로 발화될 확률 상승.
 - "정답 뒤에 모른다" 또는 "모른다만 말함" 케이스 완화.
+
+## 2026-02-15 (카메라 온오프 + Gemini 비전 입력 연동)
+
+### 대상 파일
+- `backend/server.py`
+- `temp_front/app/page.tsx`
+
+### 변경 이유
+- 사용자 요청: 프론트에서 카메라 화면 온오프를 제공하고, Gemini 음성 대화에 카메라 시각 컨텍스트를 함께 전달할 수 있게 연동.
+
+### 변경 내용
+- `backend/server.py`
+  - 설정 추가: `CAMERA_FRAME_MIN_INTERVAL_SEC` (기본 1.0초)
+  - `/ws/audio` 텍스트 메시지 처리 확장:
+    - `camera_state` (`enabled: true/false`) 수신
+    - `camera_frame_base64` (`mime_type`, `data`) 수신
+  - 카메라 프레임 전송 헬퍼 추가:
+    - Gemini Live 세션에 `send_realtime_input(media={...})`로 이미지 주입
+    - 최소 전송 간격(기본 1초) 적용
+  - 시스템 지시문에 카메라 컨텍스트 사용 지시 추가
+- `temp_front/app/page.tsx`
+  - 카메라 제어 상태/참조 추가:
+    - `isCameraOn`, `video/canvas/stream/timer` ref
+  - 카메라 온오프 버튼 추가 (`Camera On/Off`)
+  - 카메라 미리보기 영역 추가
+  - 카메라 ON 시:
+    - `getUserMedia(video)` 시작
+    - 서버에 `camera_state` 전송
+    - 3초 간격으로 JPEG 프레임 캡처 후 `camera_frame_base64` 전송
+  - 카메라 OFF/연결종료/로그아웃/언마운트 시:
+    - 타이머 정리, 트랙 종료, `camera_state:false` 전송
+
+### 기능 목적
+- 음성 대화 중 현재 카메라 장면을 함께 반영한 멀티모달 응답 가능 기반 확보.
+- 사용자 제어(ON/OFF)로 배터리/트래픽/프라이버시를 명시적으로 관리.
+
+## 2026-02-15 (카메라 UX/비전 응답 보강)
+
+### 대상 파일
+- `backend/server.py`
+- `temp_front/app/page.tsx`
+
+### 변경 이유
+- 사용자 피드백: 카메라 미리보기가 납작하게 보이고, 모델이 화면을 못 본다고 답하는 빈도가 높음.
+
+### 변경 내용
+- `backend/server.py`
+  - 카메라 상태에 `frames_sent` 카운터 추가.
+  - 첫 프레임 수신 시 Gemini 세션에 비전 컨텍스트 주입:
+    - "카메라가 켜져 있고 라이브 프레임을 최소 1개 받았다"는 정보 전달.
+  - 카메라 ON 시 초기 비전 컨텍스트 힌트 주입.
+  - 5프레임마다 서버 로그 출력:
+    - `[Vision] camera frames sent to Gemini: N`
+- `temp_front/app/page.tsx`
+  - 카메라 버튼 문구를 `Turn Camera On/Off`로 변경 (상태 혼동 완화)
+  - 카메라 상태 텍스트 추가 (`ON/OFF`, 전송 주기 표시)
+  - 비디오 미리보기 비율 개선:
+    - `h-40` 고정 높이 제거
+    - `aspect-video max-h-80 object-cover`로 변경
+
+### 기능 목적
+- 사용자가 카메라 활성 상태를 명확히 인지하고, 미리보기 왜곡 없이 확인 가능하게 개선.
+- 모델이 실제 프레임 수신 이후에는 시각 컨텍스트 기반으로 응답할 확률 향상.
+
+## 2026-02-15 (카메라 프레임 디코드 오류 수정)
+
+### 대상 파일
+- `backend/server.py`
+
+### 변경 이유
+- 런타임 로그: `[Vision] camera frame decode failed: name 'base64' is not defined`
+- 카메라 프레임(base64) 디코드 경로에서 import 누락으로 비전 입력이 전부 실패하던 문제 수정.
+
+### 변경 내용
+- `import base64` 추가.
+
+### 기능 목적
+- 카메라 프레임 디코드 정상화로 Gemini Live 비전 입력 경로 복구.
+
+## 2026-02-15 (카메라 미리보기 영역 확대)
+
+### 대상 파일
+- `temp_front/app/page.tsx`
+
+### 변경 이유
+- 사용자 피드백: 카메라 화면이 너무 작고 납작하게 보여 시인성이 낮음.
+
+### 변경 내용
+- 레이아웃 폭 확장:
+  - 상단/채팅 영역 `max-w-4xl` -> `max-w-5xl`
+  - 마이크/카메라 컨트롤 영역 `max-w-4xl` -> `max-w-6xl`
+- 카메라 프리뷰 컨테이너 패딩 확대: `p-2` -> `p-3`
+- 카메라 비디오 표시 크기 확대:
+  - `aspect-video` 유지
+  - `min-h-[320px] md:min-h-[420px] max-h-[70vh]` 추가
+  - 기존 `max-h-80` 제거
+
+### 기능 목적
+- 데스크톱에서 카메라 프리뷰를 더 크게 표시해 화면 공유형 대화 시인성 개선.
+
+## 2026-02-15 (브라우저 화면 공유 On/Off 추가)
+
+### 대상 파일
+- `temp_front/app/page.tsx`
+
+### 변경 이유
+- 사용자 요청: 브라우저 화면 공유를 켜고 끌 수 있게 추가.
+
+### 변경 내용
+- 상태/리소스 추가:
+  - `isScreenOn`
+  - `screenStreamRef`, `screenTimerRef`
+  - `clearScreenTimer`, `stopScreenProcessing`
+- 신규 로직:
+  - `startScreenProcessing()`
+    - `getDisplayMedia`로 화면 공유 시작
+    - 미리보기(video)에 화면 스트림 연결
+    - 2초 간격으로 JPEG 프레임 캡처 후 기존 메시지 스키마(`camera_frame_base64`)로 전송
+  - `toggleScreenShare()` 추가
+- 상호 배타 처리:
+  - 화면 공유 시작 시 카메라 스트림 종료
+  - 카메라 시작 시 화면 공유 종료
+- 정리 경로 보강:
+  - disconnect/error/logout/unmount 시 화면 공유 스트림/타이머 정리
+- UI 추가:
+  - `Start/Stop Screen Share` 버튼
+  - 상태 라벨에 `Screen ON/OFF` 표시
+
+### 기능 목적
+- 카메라 외에도 브라우저 탭/창/전체 화면을 Gemini 비전 입력으로 전달 가능하게 확장.
+
+## 2026-02-15 (화면공유 중 음성 끊김 완화 튜닝)
+
+### 대상 파일
+- `temp_front/app/page.tsx`
+
+### 변경 이유
+- 사용자 피드백: 화면 공유 중 AI 답변이 중간에 끊기는 현상.
+- 원인 가설: 동일 WS에서 이미지 프레임 업로드가 오디오 재생/응답 스트림과 경합.
+
+### 변경 내용
+- AI 발화 중 프레임 전송 일시 중지 로직 추가:
+  - 서버에서 오디오 Blob 수신 시 `aiSpeaking` 상태를 약 900ms 유지
+  - `aiSpeaking` 상태에서는 카메라/화면공유 프레임 업로드 skip
+- 프레임 페이로드 경량화:
+  - 카메라: 640x360@Q0.65 -> 512x288@Q0.45
+  - 화면공유: 960x540@Q0.7 -> 640x360@Q0.5
+- 전송 주기 완화:
+  - 카메라 3초 -> 4초
+  - 화면공유 2초 -> 5초
+
+### 기능 목적
+- 실시간 음성 응답 우선순위를 보장하면서 비전 컨텍스트는 저부하로 유지.
+- 답변 중간 끊김 빈도 감소.
+
+## 2026-02-15 (비전 전송 정책 전환: 연속 프레임 -> 발화 시 스냅샷)
+
+### 대상 파일
+- `backend/server.py`
+- `temp_front/app/page.tsx`
+
+### 변경 이유
+- 사용자 요청: 실사용 방식처럼 화면 ON 상태에서도 지연을 줄이기 위해, 사용자가 말할 때 캡처본을 보내고 비전 질문일 때만 사용하도록 전환.
+
+### 변경 내용
+- `backend/server.py`
+  - 설정 추가: `VISION_SNAPSHOT_TTL_SEC` (기본 20초)
+  - 비전 질문 감지 함수 `_is_vision_related_query()` 추가
+  - 세션 상태에 최신 스냅샷 저장:
+    - `camera_snapshot_base64` 수신 시 `latest_snapshot`, `snapshot_ts` 갱신
+  - 사용자 발화 처리 시:
+    - 비전 관련 질문이면 최신 스냅샷(유효기간 내)만 Gemini로 주입
+    - 비전 무관 질문은 스냅샷 미사용
+- `temp_front/app/page.tsx`
+  - 카메라/화면공유의 연속 타이머 전송 제거
+  - `sendVisionSnapshot()` 추가:
+    - 발화 시작(`Start Speaking`) 시 현재 미리보기 1장 캡처해 `camera_snapshot_base64` 전송
+  - 상태 문구를 스냅샷 모드로 변경:
+    - `ON (snapshot on speak)`
+
+### 기능 목적
+- 음성 응답 지연/끊김을 줄이면서도, 필요 시 비전 컨텍스트를 활용하는 실무형(on-demand) 멀티모달 동작 제공.
+
+## 2026-02-15 (STT 지연/정확도 개선: 16k 리샘플 + 분절 타임아웃 튜닝)
+
+### 대상 파일
+- `temp_front/app/page.tsx`
+- `backend/server.py`
+
+### 변경 이유
+- 사용자 피드백: STT 받아쓰기 지연 및 인식 정확도 저하.
+- 원인 추정: 브라우저 실제 샘플레이트(대개 48k)를 16k로 가정해 그대로 전송하던 구조.
+
+### 변경 내용
+- `temp_front/app/page.tsx`
+  - 마이크 입력 리샘플 함수 `resampleTo16k()` 추가.
+  - 입력 AudioContext를 하드웨어 기본 샘플레이트로 생성 후, `onaudioprocess`에서 16k로 변환해 전송.
+  - ScriptProcessor 버퍼 크기 4096 -> 2048로 낮춰 지연 완화.
+- `backend/server.py`
+  - STT 분절 타임아웃을 고정 100ms에서 환경변수 기반으로 변경:
+    - `STT_SEGMENTATION_SILENCE_TIMEOUT_MS` (기본 280)
+
+### 기능 목적
+- 샘플레이트 불일치로 인한 인식 품질 저하를 줄이고,
+- 너무 짧은 분절로 문장이 끊기는 문제를 완화해 STT 품질/응답 체감 개선.
+
+## 2026-02-15 (비전 스냅샷 가용성 보강: 재시도 + TTL 확장)
+
+### 대상 파일
+- `temp_front/app/page.tsx`
+- `backend/server.py`
+
+### 변경 이유
+- 사용자 피드백: 카메라 ON 상태에서도 간헐적으로 "화면을 못 본다" 응답 발생.
+- 원인: 발화 시점에 비디오 프레임 준비가 늦어 스냅샷이 비어 있는 턴이 존재.
+
+### 변경 내용
+- `temp_front/app/page.tsx`
+  - `sendVisionSnapshot()`를 성공 여부 반환으로 변경.
+  - `sendVisionSnapshotWithRetry()` 추가:
+    - 캡처 실패 시 250ms 간격, 최대 6회 재시도.
+  - 스냅샷 트리거 확대:
+    - 카메라 ON 직후 1회 재시도 캡처
+    - 화면공유 ON 직후 1회 재시도 캡처
+    - `Start Speaking` 시 재시도 캡처
+- `backend/server.py`
+  - 스냅샷 유효시간 기본값 확대:
+    - `VISION_SNAPSHOT_TTL_SEC`: 20 -> 120
+  - 비전 질문인데 스냅샷이 없을 때 서버 로그 추가:
+    - `[Vision] vision query detected but no fresh snapshot available`
+
+### 기능 목적
+- 프레임 준비 타이밍 이슈로 스냅샷이 비어 "못 봄" 응답이 나오는 빈도 감소.
+- 최근 캡처본을 더 오래 재사용해 비전 질의 안정성 향상.
+
+## 2026-02-15 (하이브리드 비전 모드: 발화 시 + 저주기 업데이트)
+
+### 대상 파일
+- `temp_front/app/page.tsx`
+
+### 변경 이유
+- 사용자 요청: 카메라/브라우저 화면 공유가 켜져 있을 때만 비전 로직을 동작시키고, 발화 시 스냅샷 기반 동작에 더해 저주기 갱신을 함께 사용.
+
+### 변경 내용
+- 비전 하트비트 타이머 추가:
+  - `visionHeartbeatTimerRef`
+  - 10초 간격으로 스냅샷 전송 시도 (`sendVisionSnapshotWithRetry`)
+  - AI가 말하는 중(`aiSpeakingRef=true`)에는 전송 스킵
+- 카메라/화면 공유 시작 시:
+  - 기존의 즉시 스냅샷 1회 + 재시도 로직 유지
+  - 하트비트 타이머 시작
+- 카메라/화면 공유 종료 및 언마운트 시:
+  - 하트비트 타이머 정리
+- 상태 문구 업데이트:
+  - `snapshot on speak` -> `speak + 10s update`
+
+### 기능 목적
+- 평소에는 오디오 지연을 줄이기 위해 과도한 연속 프레임을 피하고,
+- 카메라/화면 공유 ON 상태에서만 최신 시각 컨텍스트를 유지하는 하이브리드 모드 제공.
+
+## 2026-02-15 (비전 스냅샷 전송 실패 수정)
+
+### 대상 파일
+- `temp_front/app/page.tsx`
+
+### 변경 이유
+- 로그에서 `camera_state: enabled=true`는 들어오는데 `camera_snapshot_base64`가 갱신되지 않아
+  `[Vision] vision query detected but no fresh snapshot available`가 반복 발생.
+- 원인: 스냅샷 전송 함수가 React 상태 클로저(`isCameraOn/isScreenOn`) 조건에 막혀 전송이 스킵될 수 있었음.
+
+### 변경 내용
+- `sendVisionSnapshot()`에서 상태값 가드 제거:
+  - 제거: `if (!(isCameraOn || isScreenOn)) return;`
+  - 유지: WebSocket OPEN, video/canvas 존재, `videoWidth/videoHeight > 0` 가드
+- `sendVisionSnapshotWithRetry()` 재시도 범위 확대:
+  - 최대 6회(약 1.5초) -> 최대 20회(약 5초)
+
+### 기능 목적
+- 카메라/화면 ON 직후 프레임 준비 지연이 있어도 스냅샷이 실제로 서버에 도달하도록 보장.
+- 비전 질의 시 "fresh snapshot 없음" 오류 빈도 감소.
+
+## 2026-02-15 (비전 연속 스트리밍 모드 복귀)
+
+### 대상 파일
+- `backend/server.py`
+- `temp_front/app/page.tsx`
+- `temp_front/out/_next/static/chunks/791d6006ec8e18fd.js` (정적 배포 핫픽스)
+
+### 변경 이유
+- 스냅샷 기반 하이브리드 모드에서 `no fresh snapshot available`가 반복되어 실시간 비전 질의가 실패.
+- 사용자 요청에 따라 초기 방식(카메라/화면 ON 동안 연속 전송)으로 복귀.
+
+### 변경 내용
+- `backend/server.py`
+  - `camera_snapshot_base64` 수신 시 저장만 하던 로직을 변경:
+    - `latest_snapshot/snapshot_ts` 갱신 + 즉시 Gemini로 프레임 전송(`_send_camera_frame_to_gemini`)
+  - 비전 질의 시 스냅샷이 없을 때 강제 부정 컨텍스트(`No recent snapshot...`) 주입 제거.
+- `temp_front/app/page.tsx`
+  - 비전 heartbeat를 10초에서 1.2초로 조정하여 사실상 연속 스트리밍으로 복귀.
+  - AI 발화 중 스킵 조건 제거(연속 전송 유지).
+  - 상태 문구를 `continuous stream`으로 변경.
+- `temp_front/out/...js`
+  - 정적 서빙 경로 반영을 위해 연속 전송 동작이 즉시 적용되도록 핫픽스 반영.
+
+### 기능 목적
+- 카메라/화면 공유 ON 상태에서 비전 컨텍스트를 안정적으로 계속 공급해,
+- 모델이 "화면 못 봄"으로 빠지는 현상을 줄이고 실시간 질의 응답을 복구.
+
+## 2026-02-15 (비전 로그 축소 + 실시간 화면 말투 고정)
+
+### 대상 파일
+- `backend/server.py`
+
+### 변경 이유
+- 연속 비전 스트리밍에서 `snapshot updated` 로그가 과다 출력되어 콘솔 가독성이 떨어짐.
+- 사용자 체감은 실시간 화면 대화인데, 모델이 "보내주신 이미지/사진" 같은 표현을 사용해 어색함 발생.
+
+### 변경 내용
+- 비전 로그 축소:
+  - `camera_state`에 `snapshot_updates` 카운터 추가
+  - 스냅샷 로그를 매번 출력하지 않고 `1회차` 및 `20회 단위`로만 출력
+  - 카메라 OFF 시 `snapshot_updates` 카운터 리셋
+- 말투/표현 지침 강화:
+  - 시스템 지시문에 "시각 컨텍스트가 있을 때 '보내주신 이미지/사진에서/실시간 화면 못 본다' 표현 금지" 추가
+  - "지금 화면에서 ..."처럼 실시간 화면 기준으로 답변하도록 명시
+- 내부 비전 컨텍스트 문구 정리:
+  - `[VISION] A recent user-side snapshot ...` -> `[VISION] Recent visual context ...`
+
+### 기능 목적
+- 운영 로그 노이즈를 줄이면서 디버깅에 필요한 핵심 카운트는 유지.
+- 사용자에게 실시간 화면 대화처럼 자연스럽게 들리는 응답 톤 일관성 확보.
+
+## 2026-02-15 (weather/air intent에서 ODSay 호출 차단)
+
+### 대상 파일
+- `backend/server.py`
+
+### 변경 이유
+- `weather`/`air_quality` 질의에서도 공통 live 빌더를 통해 ODSay(역/경로)가 호출되어,
+  ODSay IP 미등록 환경에서 불필요한 인증 에러 로그가 반복 발생.
+
+### 변경 내용
+- `_execute_tools_for_intent()` 초기에 intent 분기 추가:
+  - `intent in {"weather", "air_quality"}`일 때
+    - ODSay/역 탐색/경로 계산을 전부 우회
+    - `_get_weather_and_air(lat, lng)`만 호출해 결과 구성
+    - 해당 intent 전용 `speechSummary`를 즉시 생성해 반환
+- 기존 교통 intent(`subway_route`, `bus_route`, `commute_overview`)는 기존 경로 유지.
+
+### 기능 목적
+- 날씨/대기질 질의에서 ODSay 의존 제거.
+- ODSay 키/허용 IP 이슈가 있어도 날씨/대기질 응답은 정상 제공.
+
+## 2026-02-15 (weather/air 컨텍스트 우선 응답 강제)
+
+### 대상 파일
+- `backend/server.py`
+
+### 변경 이유
+- `intent=weather`/`air_quality`에서 `summary_ok=True`인데도 모델이 "라이브 컨텍스트 없음"처럼 응답하는 케이스 발생.
+- 원인: 해당 intent는 `ACTION` 지시/`complete_turn` 강제가 빠져 컨텍스트 주입 우선순위가 낮았음.
+
+### 변경 내용
+- 동적 컨텍스트 주입 로직에서 우선처리 intent 집합 확장:
+  - 기존: `subway_route`, `bus_route`, `commute_overview`
+  - 변경: `subway_route`, `bus_route`, `commute_overview`, `weather`, `air_quality`
+- 위 intent들에 대해:
+  - `[ACTION]` 지시문 추가 적용
+  - `complete_turn=True`로 컨텍스트 턴 우선 처리
+  - direct audio 입력 게이트(2.5초) 동일 적용
+
+### 기능 목적
+- 날씨/대기질 질의에서도 생성된 live summary를 우선 사용해 즉답.
+- "데이터 없음/컨텍스트 없음" 오응답 빈도 감소.
+
+## 2026-02-15 (선행 "모름" 응답 차단: 게이트 시점 앞당김)
+
+### 대상 파일
+- `backend/server.py`
+
+### 변경 이유
+- weather/air 질의에서 live context(`summary_ok=True`)가 만들어졌는데도
+  direct-audio 경로 응답이 먼저 나가 "알 수 없음" 발화가 선행되는 문제 발생.
+
+### 변경 내용
+- `should_inject_live` 분기 진입 즉시 direct-audio 게이트를 선적용:
+  - `transit_turn_gate["until"] = now + 4.0s` (max 방식)
+  - 위치/툴 호출/컨텍스트 주입보다 먼저 적용
+- 기존 ACTION 구간의 게이트 갱신은 유지하되 `max` 방식으로 누적 연장.
+
+### 기능 목적
+- 라우팅 intent(weather/air 포함)에서 raw audio 선응답을 막고,
+- live context 기반 최종 답변이 먼저 나오도록 순서 보장 강화.
+
+## 2026-02-15 (선발화 차단 2차: 출력 오디오 게이트 추가)
+
+### 대상 파일
+- `backend/server.py`
+
+### 변경 이유
+- 입력 게이트를 앞당겨도, 이미 Gemini에서 생성된 선응답 오디오가 먼저 사용자에게 출력되는 케이스가 남음.
+
+### 변경 내용
+- `send_to_client()` 출력 루프에 오디오 게이트 추가:
+  - `time.monotonic() < transit_turn_gate['until']` 동안은 `part.inline_data` 오디오를 `ws.send_bytes`로 전달하지 않고 폐기.
+- 기존 입력 게이트(수신 오디오 `send_realtime_input` 차단)와 함께 동작하여
+  라우팅 intent(weather/air 포함)의 선응답 가능성을 이중으로 차단.
+
+### 기능 목적
+- "알 수 없음" 같은 선행 발화를 사용자에게 들리지 않게 차단.
+- live context 기반 최종 답변만 우선 출력되도록 순서 안정화.
+
+## 2026-02-15 (날씨/대기질 응답 지연 완화: 게이트 타이밍 튜닝)
+
+### 대상 파일
+- `backend/server.py`
+
+### 변경 이유
+- 선발화는 사라졌지만, 게이트 시간이 길어 최종 답변 시작 지연이 커짐.
+
+### 변경 내용
+- 라우팅 intent 진입 시 초기 게이트 축소:
+  - `+4.0s` -> `+1.2s`
+- ACTION 단계 연장 게이트 축소:
+  - `+2.5s` -> `+0.8s`
+- `injected_context`를 실제 세션에 전송한 직후 게이트 조기 해제 로직 추가:
+  - `transit_turn_gate['until']`를 `now+0.15s` 수준으로 빠르게 당김(`min` 사용)
+
+### 기능 목적
+- 선행 "모름" 발화 차단은 유지하면서,
+- live context 주입 완료 후 답변 시작 지연을 최소화.
+
+## 2026-02-15 (weather/air에서 목적지 컨텍스트 혼입 차단)
+
+### 대상 파일
+- `backend/server.py`
+
+### 변경 이유
+- `intent=weather`인데도 목적지(예: 광화문) 가이드가 함께 주입되어,
+  "광화문/이태원 이동 계획" 같은 교통성 문장이 날씨 답변 앞에 섞이는 현상 발생.
+
+### 변경 내용
+- 동적 guidance 생성 로직에 `transit_intents` 분리 추가:
+  - `transit_intents = {"subway_route", "bus_route", "commute_overview"}`
+- 목적지 관련 guidance/질문 유도는 transit intent에서만 적용:
+  - `Use destination ...` 문구
+  - 목적지 재질문(`Ask destination exactly once ...`)
+- weather/air intent는 위치 기반 날씨/대기질 정보만 주입하도록 정리.
+
+### 기능 목적
+- 날씨/대기질 질의에서 목적지 주제 혼입 제거.
+- 질문 intent에 맞는 단일 주제 답변 안정화.
+
+## 2026-02-15 (weather/air에서 destination 전달/로그 완전 제거)
+
+### 대상 파일
+- `backend/server.py`
+
+### 변경 이유
+- `intent=weather`인데도 `live context built` 로그에 `destination=광화문`이 찍혀
+  문맥 혼입처럼 보이고 실제 응답에도 교통성 문장이 섞일 여지가 있었음.
+
+### 변경 내용
+- live context 구성 직전에 `context_destination` 도입:
+  - `intent in {subway_route, bus_route, commute_overview}`일 때만 `destination_state['name']` 사용
+  - `weather`, `air_quality`, `general`은 `None` 사용
+- `_execute_tools_for_intent(... destination_name=...)`에 `context_destination` 전달
+- 로그도 `destination={context_destination}`로 출력
+
+### 기능 목적
+- 날씨/대기질 질의에서 목적지 컨텍스트 전달을 완전히 차단.
+- 로그와 실제 컨텍스트를 동일하게 맞춰 디버깅 혼선 제거.
+
+## 2026-02-15 (선발화 재발 방지 3차: 선응답 턴 폐기 가드)
+
+### 대상 파일
+- `backend/server.py`
+
+### 변경 이유
+- `intent=weather`, `summary_ok=True` 이후에도 간헐적으로 "알 수 없음" 선응답이 먼저 출력되는 레이스가 재발.
+- 원인: live context 적용 전 생성된 오디오 턴이 출력단에서 먼저 전달되는 경우가 존재.
+
+### 변경 내용
+- `response_guard` 상태 추가:
+  - `active`, `context_sent`, `suppressed_audio_seen`
+- 라우팅 intent 처리 시작 시 가드 활성화.
+- live context 주입 예약 후 `context_sent=True` 설정.
+- 출력 루프(`send_to_client`)에서:
+  - 게이트 구간 오디오는 폐기 + `suppressed_audio_seen=True` 기록
+  - 구형 턴으로 판단되는 오디오는 `turn_complete` 전까지 계속 폐기
+- `turn_complete` 시 가드 해제:
+  - stale turn 종료 후 다음 턴부터 정상 출력 허용
+
+### 기능 목적
+- 컨텍스트 이전에 생성된 선행 "모름" 발화를 사용자에게 전달하지 않도록 차단.
+- 최종 live context 기반 답변만 우선 출력되도록 안정화.
+
+## 2026-02-15 (선발화 재발 4차: 컨텍스트 우선 턴 direct-audio 하드 차단)
+
+### 대상 파일
+- `backend/server.py`
+
+### 변경 이유
+- 출력 게이트만으로는 선응답이 완전히 사라지지 않고,
+  weather/air 질의에서 "없다/모른다" 선발화 후 정답이 뒤따르는 레이스가 재발.
+
+### 변경 내용
+- `response_guard` 확장:
+  - `block_direct_audio`
+  - `block_direct_audio_until`
+- `should_inject_live` 진입 시:
+  - direct-audio 입력을 즉시 하드 차단(`block_direct_audio=True`)
+  - 안전 타임아웃(`+6s`) 설정
+- 입력 루프의 Gemini direct-audio 전송 조건 강화:
+  - `block_direct_audio=False`일 때만 전송
+  - `block_direct_audio_until` 경과 후에만 전송
+- `turn_complete`에서 가드 해제:
+  - stale/normal guarded turn 종료 시 direct-audio 차단 해제
+
+### 기능 목적
+- 컨텍스트 우선 턴에서 raw audio 선응답 자체를 입력단에서 원천 차단.
+- "선발화 -> 정답" 이중 응답을 구조적으로 억제.
+
+## 2026-02-15 (weather/air 지연 체감 완화: 선행 확인 멘트 추가)
+
+### 대상 파일
+- `backend/server.py`
+
+### 변경 이유
+- 날씨/대기질 값 조회 전 짧은 공백 구간에서 사용자 체감이 나빠짐.
+- 사용자 요청: "제가 확인해볼게요" 같은 짧은 지연 멘트 선행.
+
+### 변경 내용
+- `should_inject_live` 분기에서 `intent in {weather, air_quality}`일 때,
+  live 값 응답 전에 별도 filler 턴 주입:
+  - `_inject_live_context_now(..., complete_turn=True)`
+  - 지시: 한 문장 확인 멘트만 발화
+  - 지시: 값/후속질문은 filler 턴에서 금지
+
+### 기능 목적
+- 날씨/대기질 조회 지연 동안 대화 흐름을 자연스럽게 유지.
+- 사용자 입장에서 "멈춘 느낌"을 줄이고 응답 예측 가능성 향상.
+
+## 2026-02-15 (선발화 강제 차단 5차: 컨텍스트 턴 동안 direct-audio 완전 차단)
+
+### 대상 파일
+- `backend/server.py`
+
+### 변경 이유
+- weather/air 질의에서 여전히 "정보를 못 가져온다" 선발화가 먼저 출력되는 케이스 지속.
+- 요구사항: 선발화를 강제로 지연 멘트/컨텍스트 기반 응답으로 대체.
+
+### 변경 내용
+- `response_guard` 상태 확장:
+  - `forced_intent_turn` 추가
+- `should_inject_live` 진입 시 (weather/air 포함 컨텍스트 우선 턴):
+  - `block_direct_audio=True` 강제
+  - `block_direct_audio_until=now+8s` 안전 타임아웃
+  - `forced_intent_turn=intent` 기록
+- 입력 루프의 Gemini direct-audio 전송 조건은 기존대로
+  - `block_direct_audio=False`일 때만 허용
+- 출력 turn_complete에서 guarded turn 종료 시:
+  - `block_direct_audio` 해제
+  - `forced_intent_turn` 초기화
+
+### 기능 목적
+- 컨텍스트 우선 턴에서 raw audio 선응답을 입력단에서 원천 차단.
+- "선발화(모름) -> 실제값" 이중응답을 구조적으로 억제.
+
+## 2026-02-15 (weather/air 선발화 강제 폐기: 첫 턴 드롭 + 컨텍스트 재주입)
+
+### 대상 파일
+- `backend/server.py`
+
+### 변경 이유
+- weather/air에서 direct-audio 레이스로 선행 "모름" 턴이 남아, 기존 게이트/차단만으로 완전 제거되지 않음.
+
+### 변경 내용
+- `response_guard` 확장:
+  - `drop_first_turn`, `reinject_context_text`
+- `should_inject_live` 진입 시( weather/air + direct-audio ): 
+  - `drop_first_turn=True` 설정
+- 컨텍스트 생성 후(weather/air):
+  - `reinject_context_text=ctx_text` 저장
+- 출력 루프:
+  - `drop_first_turn=True` 동안 첫 모델 오디오 턴을 전부 폐기
+  - 해당 턴의 `turn_complete` 수신 시:
+    - `drop_first_turn=False`
+    - 저장된 `reinject_context_text`를 `complete_turn=True`로 재주입
+
+### 기능 목적
+- weather/air 질의에서 선행 "정보 없음" 턴을 구조적으로 제거.
+- 이후 live context 기반 최종 답변 턴만 사용자에게 출력.
+
+## 2026-02-15 (weather/air 안정화: 즉시 로딩멘트 + 중복/끊김 경로 정리)
+
+### 대상 파일
+- `backend/server.py`
+
+### 변경 이유
+- 사용자 이슈 3종 동시 발생:
+  1) 로딩멘트가 늦음
+  2) 같은 답변 중복 발화
+  3) 미세먼지 질의 시 1008 연결 종료
+
+### 변경 내용
+- 즉시 로딩멘트:
+  - 라우터 호출 전에 키워드(날씨/기온/강수/미세먼지/대기질/aqi) 감지 시
+  - `loading_weather_fast` 턴을 즉시 `complete_turn=True`로 주입
+- 중복 완화:
+  - STT 디듀프 정규화 강화: 공백만 제거 -> 공백/문장부호/특수문자 제거
+  - `weather_filler_text` 중복 주입 방지(`pre_weather_filler_sent` 도입)
+- 1008 안정화:
+  - 출력 루프의 `drop_first_turn/reinject_context_text` 기반 재주입 경로 제거
+  - 해당 경로는 출력 task 내부에서 추가 `send_client_content` 호출을 만들어 불안정 원인이 될 수 있어 제거
+- direct-audio 차단 타임아웃 조정:
+  - `block_direct_audio_until` 8초 -> 4초
+
+### 기능 목적
+- 질문 직후 체감 가능한 로딩 멘트 제공.
+- 동일 답변 2회 발화 감소.
+- 미세먼지 질의 시 출력 루프 관련 1008 끊김 리스크 완화.
+
+## 2026-02-15 (weather/air 응답 체감 개선: 필러 선발화 동기 보장 + 조회 분리)
+
+### 대상 파일
+- `backend/server.py`
+
+### 변경 이유
+- 사용자 피드백:
+  - weather 후 air_quality에서 선발화 재발
+  - 답변 지연 큼
+  - 필러 멘트가 조회 완료 후 늦게 나오는 체감
+
+### 변경 내용
+- 필러 순서 보장:
+  - weather/air intent에서 live 조회 전에 filler 턴을 주입
+  - `run_coroutine_threadsafe(...).result(timeout=1.0)`로 제출 완료를 동기 보장
+  - 필러 문구는 값/후속질문 금지
+- 중복 필러 경로 정리:
+  - 키워드 기반 사전 필러 경로 제거
+  - weather/air 전용 단일 필러 경로로 통합
+- 속도 개선:
+  - `weather`는 `_get_weather_only()`만 호출
+  - `air_quality`는 `_get_air_only()`만 호출
+  - 기존처럼 두 API를 매번 모두 호출하던 구조 제거
+
+### 기능 목적
+- 질문 직후 즉시 필러가 먼저 나오고, 값 응답은 그 다음으로 일관되게 출력.
+- 날씨/대기질 응답 지연 감소.
+- weather -> air_quality 연속 질의 시 선발화 재발 가능성 완화.
+
+## 2026-02-15 (weather/air 전용 응답 경로 단순화: 필러 즉시 발화 우선)
+
+### 대상 파일
+- `backend/server.py`
+
+### 변경 이유
+- weather -> air_quality 연속 질의에서 선발화 재발 및 체감 지연 발생.
+- 원인: transit용 출력 게이트 로직과 env intent가 함께 적용되며 필러 타이밍이 밀릴 수 있음.
+
+### 변경 내용
+- `should_inject_live`에서 env intent(`weather`, `air_quality`) 분기 분리:
+  - env intent는 `response_guard.active=False` (출력 suppress 로직 비활성)
+  - env intent는 `transit_turn_gate`를 현재시각으로 설정해 출력 게이트를 사실상 비활성
+  - direct-audio는 env 처리 중에만 잠깐 차단(`block_direct_audio_until=+5s`)
+- env intent 컨텍스트 주입 완료 직후:
+  - `block_direct_audio` 즉시 해제
+  - forced intent 가드 초기화
+
+### 기능 목적
+- weather/air에서 필러 멘트를 즉시 들리게 하고,
+- 값 응답은 한 번만 빠르게 이어지도록 경로 단순화.
+
+## 2026-02-15 - 환경(날씨/대기질) 상세 캐시 선적재 개선
+- 수정 파일: `backend/server.py`
+- 목적: 접속 직후 날씨/대기질 데이터를 미리 가져와 세션 캐시에 저장하고, 질문 시 즉시 응답할 수 있도록 개선.
+
+### 변경 내용
+1. 세션 환경 캐시 추가
+- `audio_websocket` 세션 상태에 `env_cache`를 추가했습니다.
+- 구조: `weather`, `air`, `lat`, `lng`, `ts(monotonic)`.
+
+2. 접속 시 선적재(preload)
+- Gemini Live 세션 연결 직후 `_preload_env_cache(force=True)`를 호출해 현재 좌표 기준 날씨/대기질을 미리 저장하도록 했습니다.
+- 로그: `[SeoulInfo] Env cache refreshed: weather=..., air=...`.
+
+3. 위치 변경 시 백그라운드 갱신
+- `location_update` 수신 시 이동 거리(`>=80m`)가 확인되면 백그라운드로 캐시 갱신 작업을 트리거하도록 했습니다.
+- 과도한 호출을 줄이기 위해 TTL/거리 조건을 함께 사용합니다.
+
+4. 캐시 신선도 판별 함수 추가
+- `_is_env_cache_fresh(env_cache, lat, lng)` 추가.
+- TTL(`ENV_CACHE_TTL_SEC`)과 좌표 이동 거리(<200m) 기준으로 캐시 유효성 판단.
+
+5. weather/air intent에서 캐시 우선 사용
+- `_execute_tools_for_intent(..., env_cache=...)`에서 `weather`, `air_quality` 의도 처리 시 캐시를 우선 사용합니다.
+- 캐시가 오래되었거나 좌표가 많이 바뀐 경우 `_get_weather_and_air`로 한 번에 재조회하고 캐시 갱신합니다.
+
+6. 상세 필드 저장 + 음성 요약 확장
+- 날씨 저장 필드: 현재기온, 강수량, 비, 구름량, 코드, 하늘상태, 최고/최저, 강수확률.
+- 대기질 저장 필드: US AQI, PM2.5, PM10, 등급.
+- 음성 요약은 간결하게 유지하되(현재/최고최저/강수확률/하늘상태 등), 상세 데이터는 캐시에 유지합니다.
+
+### 최소 수정 원칙
+- `server.py`, `run_server.py` 구조는 유지하고, 기존 라우팅/음성 파이프라인을 건드리지 않는 범위에서 캐시 경로만 보강했습니다.
+- 추가 조정: `weather/air_quality` 의도의 강제 필러 멘트 주입 블록을 제거했습니다. (접속 시 선적재 캐시 사용 전제로 즉답)
+- 추가 수정(선발화 차단): `weather/air_quality`를 포함한 모든 라이브 의도에서 응답 게이트를 동일하게 활성화했습니다.
+- 추가 수정(핵심): 라이브 컨텍스트가 실제로 주입(`context_sent=True`)되기 전 모델 오디오는 강제로 드롭하도록 처리했습니다.
+- 기대 효과: 캐시가 있어도 먼저 나가던 "확인 불가" 선발화를 차단하고, 컨텍스트 기반 최종 답변만 출력.
