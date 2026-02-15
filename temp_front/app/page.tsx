@@ -436,6 +436,23 @@ export default function Home() {
     }
     if (isRecording) return;
     try {
+      // Defensive cleanup for restart stability (Stop -> Start race cases).
+      processorRef.current?.disconnect();
+      if (processorRef.current) processorRef.current.onaudioprocess = null as any;
+      processorRef.current = null;
+      sourceRef.current?.disconnect();
+      sourceRef.current = null;
+      if (micStreamRef.current) {
+        micStreamRef.current.getTracks().forEach((t) => t.stop());
+        micStreamRef.current = null;
+      }
+      if (inputContextRef.current) {
+        try {
+          await inputContextRef.current.close();
+        } catch {}
+        inputContextRef.current = null;
+      }
+
       await sendLocationUpdate(websocketRef.current);
       if (!aiSpeakingRef.current) {
         sendVisionSnapshotWithRetry();
@@ -461,7 +478,11 @@ export default function Home() {
           const s = Math.max(-1, Math.min(1, resampled[i]));
           pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
         }
-        websocketRef.current.send(pcmData.buffer);
+        try {
+          websocketRef.current.send(pcmData.buffer);
+        } catch (err) {
+          console.warn("Audio send failed:", err);
+        }
       };
 
       sourceRef.current.connect(processorRef.current);
@@ -475,6 +496,7 @@ export default function Home() {
   };
 
   const stopAudioProcessing = () => {
+    if (processorRef.current) processorRef.current.onaudioprocess = null as any;
     processorRef.current?.disconnect();
     processorRef.current = null;
     sourceRef.current?.disconnect();

@@ -2027,3 +2027,28 @@
 ### impact
 - behavior preserved; logic moved to module.
 - `server.py` websocket receive block is shorter and easier to merge.
+
+## 2026-02-15 - 선발화/StartSpeaking 재시작 안정화 보강
+- 브랜치: `mun-cleanup-server`
+- 목적:
+  - 실시간 질의에서 간헐적으로 "모른다"가 먼저 나오는 선발화 완화
+  - `Stop Speaking -> Start Speaking` 재시작 시 STT/응답이 멈추는 현상 완화
+
+### server.py 변경
+- 사용자 STT `recognizing` 이벤트 핸들러 추가
+  - 사용자 발화 중/직후 초기 구간에 모델 오디오를 잠시 게이트(`speech_capture_gate`)하도록 적용
+  - 같은 구간에서 direct-audio 입력을 짧게 하드 블록(`block_direct_audio_until`)해 pre-context 응답 발생 가능성 축소
+- `receive_from_client` 경로에 하드블록 자동해제 안전장치 추가
+  - `block_direct_audio_until` 경과 시 `block_direct_audio=False`로 자동 전환
+- `send_to_client` 경로에 `speech_capture_gate` 체크 추가
+  - 사용자 발화 finalize 직전/직후에 들어오는 조기 모델 오디오를 드롭
+
+### temp_front/app/page.tsx 변경
+- `startAudioProcessing()` 시작 시 방어적 오디오 리소스 정리 추가
+  - 이전 `processor/source/micStream/inputContext`를 먼저 정리/종료한 뒤 새 세션 생성
+- 오디오 전송 시 `websocket.send()` 예외 처리 추가
+- `stopAudioProcessing()`에서 `onaudioprocess`를 null로 명시 해제
+
+### 기대 효과
+- 라우팅/컨텍스트 주입 전에 모델이 선응답하는 현상 빈도 감소
+- Speak 버튼 재시작 시 오디오 노드 꼬임/중복으로 인한 무응답 현상 완화

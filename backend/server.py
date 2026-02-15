@@ -1042,6 +1042,7 @@ async def audio_websocket(ws: WebSocket):
     route_dedupe = {"text": "", "ts": 0.0}
     user_activity = {"last_user_ts": time.monotonic()}
     transit_turn_gate = {"until": 0.0}
+    speech_capture_gate = {"until": 0.0}
     response_guard = {
         "active": False,
         "context_sent": False,
@@ -1386,8 +1387,26 @@ async def audio_websocket(ws: WebSocket):
             else:
                 print(f"[Error] Main loop is closed. Cannot send STT: {text}")
 
+    def on_recognizing(args, role):
+        if role != "user":
+            return
+        text = str(getattr(args.result, "text", "") or "").strip()
+        if not text:
+            return
+        now_ts = time.monotonic()
+        user_activity["last_user_ts"] = now_ts
+        # Gate early model audio while user speech is being finalized by STT.
+        speech_capture_gate["until"] = max(float(speech_capture_gate.get("until") or 0.0), now_ts + 1.2)
+        # Also hard-block direct audio briefly to avoid stale pre-context model turns.
+        response_guard["block_direct_audio"] = True
+        response_guard["block_direct_audio_until"] = max(
+            float(response_guard.get("block_direct_audio_until") or 0.0),
+            now_ts + 1.5,
+        )
+
     user_recognizer.recognized.connect(lambda evt: on_recognized(evt, "user"))
     ai_recognizer.recognized.connect(lambda evt: on_recognized(evt, "ai"))
+    user_recognizer.recognizing.connect(lambda evt: on_recognizing(evt, "user"))
 
     user_recognizer.start_continuous_recognition()
     ai_recognizer.start_continuous_recognition()
@@ -1460,6 +1479,13 @@ async def audio_websocket(ws: WebSocket):
                         if not data:
                             continue
 
+                        # Safety release: if timed block elapsed, release hard block flag.
+                        if (
+                            response_guard.get("block_direct_audio")
+                            and time.monotonic() >= float(response_guard.get("block_direct_audio_until") or 0.0)
+                        ):
+                            response_guard["block_direct_audio"] = False
+
                         # Inject freshest per-turn live context before audio chunk when available.
                         injected_context = None
                         async with dynamic_context_lock:
@@ -1516,6 +1542,9 @@ async def audio_websocket(ws: WebSocket):
                                 for part in response.server_content.model_turn.parts:
                                     if part.inline_data:
                                         audio_bytes = part.inline_data.data
+                                        # Drop model audio during user speech capture/finalization window.
+                                        if time.monotonic() < float(speech_capture_gate.get("until") or 0.0):
+                                            continue
                                         # Suppress premature model audio while live-context turn is being prepared.
                                         if time.monotonic() < float(transit_turn_gate.get("until") or 0.0):
                                             if response_guard.get("active"):
