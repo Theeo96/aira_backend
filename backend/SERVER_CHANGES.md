@@ -1804,3 +1804,130 @@
 - 추가 수정(선발화 차단): `weather/air_quality`를 포함한 모든 라이브 의도에서 응답 게이트를 동일하게 활성화했습니다.
 - 추가 수정(핵심): 라이브 컨텍스트가 실제로 주입(`context_sent=True`)되기 전 모델 오디오는 강제로 드롭하도록 처리했습니다.
 - 기대 효과: 캐시가 있어도 먼저 나가던 "확인 불가" 선발화를 차단하고, 컨텍스트 기반 최종 답변만 출력.
+
+## 2026-02-15 - 네이버 뉴스 기능(브랜치 feature/news_phy) 최소 결합
+- 수정 파일: `backend/server.py`
+- 목적: 기존 음성 대화 파이프라인을 유지한 채 뉴스 질의를 모듈 방식으로 처리.
+
+### 변경 내용
+1. 뉴스 모듈 연결
+- `from modules.news_agent import NewsAgent` 추가.
+- 서버 시작 시 `NEWS_AGENT` 초기화(실패 시 안전하게 `None` 처리).
+
+2. Intent Router 확장
+- fallback 키워드에 `뉴스/헤드라인/속보/기사` 추가.
+- LLM intent 허용 집합에 `news` 추가.
+
+3. 뉴스 조회 헬퍼 추가
+- `_extract_news_topic_from_text(text)`: 발화에서 뉴스 토픽 추출.
+- `_get_news_headlines(topic, limit)`: `NewsAgent._search_naver_news` 호출 후 헤드라인 목록 반환.
+
+4. 의도 실행 분기 추가
+- `_execute_tools_for_intent(..., user_text=...)`에 `news` 분기 추가.
+- 반환 구조에 `news.topic`, `news.headlines` 포함.
+- 음성용 `speechSummary`는 짧게 구성.
+
+5. 라이브 응답 경로 연결
+- `routing_intents` / `context_priority_intents`에 `news` 추가.
+- `_execute_tools_for_intent` 호출 시 `user_text` 전달.
+
+### 참고
+- 이번 커밋은 `server.py` 최소 결합만 수행했습니다.
+- 기존 교통/날씨/대기질 로직은 유지하고, 뉴스 질의만 추가 확장했습니다.
+
+## 2026-02-15 - Gmail 긴급 메일 알림(프로액티브) 추가
+- 수정 파일: `backend/modules/gmail_alert_module.py`, `backend/server.py`
+- 목적: Gmail 메일 중 긴급 키워드가 포함된 메일만 사용자에게 선제적으로 음성 안내.
+
+### 변경 내용
+1. 신규 모듈 추가: `backend/modules/gmail_alert_module.py`
+- Gmail IMAP(ssl)로 `UNSEEN` 메일 조회.
+- 제목/본문/보낸사람 기반 긴급 키워드 매칭.
+- 중복 알림 방지를 위해 `Message-ID` 기반 delivered set 유지.
+- 알림 문구 요약(`summary`) 생성.
+
+2. 서버 연결 (`backend/server.py`)
+- `GmailAlertModule` 초기화 및 세션 내 백그라운드 루프(`gmail_alert_loop`) 추가.
+- 연결 중 주기(`GMAIL_POLL_INTERVAL_SEC`)마다 긴급 메일 확인.
+- 사용자 발화 직후/응답 중인 턴은 건너뛰어 대화 방해 최소화.
+- 탐지 시 Gemini에 라이브 컨텍스트로 주입하여 한 문장 프로액티브 안내.
+
+3. 환경변수 추가
+- `GMAIL_IMAP_USER`: Gmail 주소
+- `GMAIL_IMAP_APP_PASSWORD`: Gmail 앱 비밀번호(2단계 인증 기반)
+- `GMAIL_IMAP_MAILBOX`: 기본 `INBOX`
+- `GMAIL_URGENT_KEYWORDS`: 콤마 구분 키워드 목록
+- `GMAIL_POLL_INTERVAL_SEC`: 폴링 주기(초), 기본 60
+- `GMAIL_ALERT_BIND_USER`: websocket user_id와 Gmail 계정 일치 시만 알림(기본 true)
+
+## 2026-02-15 - Gmail 긴급메일 2단계 분류(키워드 + LLM) 적용
+- 수정 파일: `backend/modules/gmail_alert_module.py`
+- 목적: 단순 키워드 오탐을 줄이기 위해 2단계 판정으로 고도화.
+
+### 2단계 판정
+1. 1차: 키워드 후보 필터
+- 제목/본문/발신자 텍스트에 `GMAIL_URGENT_KEYWORDS` 포함 시 후보로 채택.
+
+2. 2차: LLM 재판정
+- Azure OpenAI로 `urgent`, `confidence`, `reason` JSON 판정.
+- `confidence >= GMAIL_URGENT_LLM_CONFIDENCE` 일 때만 최종 긴급으로 통과.
+
+### 신규/추가 env
+- `GMAIL_URGENT_USE_LLM` (default: true)
+- `GMAIL_URGENT_REQUIRE_LLM` (default: false)
+- `GMAIL_URGENT_LLM_MODEL` (default: `AZURE_OPENAI_DEPLOYMENT_NAME` 또는 `gpt-4o-mini`)
+- `GMAIL_URGENT_LLM_CONFIDENCE` (default: 0.55)
+
+### 동작 메모
+- LLM이 불가할 때:
+  - `GMAIL_URGENT_REQUIRE_LLM=false`면 키워드 기반 fallback 허용
+  - `GMAIL_URGENT_REQUIRE_LLM=true`면 알림 차단
+- 추가 수정: Gmail 긴급 분류 기본 모드를 `llm_only`로 전환했습니다. (`GMAIL_URGENT_CLASSIFY_MODE`)
+- 추가 수정: `GMAIL_URGENT_REQUIRE_LLM` 기본값을 true로 바꿔 LLM 판정 실패 시 알림을 막도록 했습니다.
+- 추가 수정: Gmail 알림 루프가 연결 직후 첫 조회를 바로 수행하도록 변경했습니다. (기존 첫 60초 대기 제거)
+- 추가 수정: 주기 조회마다 디버그 로그(`[GmailAlert] polled: no urgent unread mail`)를 출력해 동작 여부 확인 가능.
+
+## 2026-02-15 - Gmail 알림 시점 로직 개선 (이전 종료~현재 접속 + 접속중 실시간)
+- 수정 파일: `backend/modules/gmail_alert_module.py`, `backend/server.py`
+- 목적: 요청사항 반영
+  - 접속 시: 이전 마지막 종료 시각 ~ 현재 접속 시각 사이 메일 중 긴급건만 안내
+  - 접속 중: 새로 들어온 메일만 실시간 확인, 긴급건만 안내
+
+### 구현 상세
+1. 세션 상태 저장 추가 (`gmail_alert_state.json`)
+- `last_disconnect_by_user`: 사용자별 마지막 종료시각 저장
+- `delivered_ids`: 이미 안내한 메일 ID 저장(중복 방지)
+
+2. 모듈 API 추가
+- `begin_session(user_id, connected_at_ts)`
+  - 이전 종료시각부터 현재 접속시각까지 백로그 스캔 후 긴급건 반환
+- `poll_live_alerts(user_id)`
+  - 접속 중 마지막 폴링 이후~현재 시각 사이 신규 메일만 스캔
+- `end_session(user_id, disconnected_at_ts)`
+  - 종료 시각 저장
+
+3. 서버 연동
+- 연결 후 `gmail_alert_loop` 시작 시 `begin_session` 1회 수행
+- 루프 내에서는 `poll_live_alerts` 주기 호출
+- websocket 종료 finally에서 `end_session` 호출
+
+4. 분류 모드
+- `GMAIL_URGENT_CLASSIFY_MODE=llm_only`(기본) 또는 `hybrid`
+- 현재 기본은 llm-only로 동작
+- 추가 수정: Gmail 알림 디버그 로그(`GMAIL_ALERT_DEBUG`)를 추가해, 폴링/분류/스킵 사유를 로그에서 즉시 확인할 수 있게 했습니다.
+- 추가 수정: Gmail 루프 시작 로그에 사용자 식별(`user_id`)를 포함했습니다.
+- 추가 변경: 접속 중 Gmail 알림을 주기 폴링 기반에서 IMAP IDLE 이벤트 대기 기반으로 전환했습니다.
+- 동작: `wait_next_live_alert(user_id, idle_timeout)`가 새 메일 EXISTS 이벤트를 기다린 뒤 해당 시간창 메일만 긴급 판정.
+- 접속 시 백로그 1회 확인(`begin_session`)은 유지.
+- 신규 env: `GMAIL_IDLE_TIMEOUT_SEC` (기본 120초)
+- 추가 수정: IMAP IDLE 도착 신호 누락 대비로 접속 중 `poll_live_alerts` fallback 경로를 추가했습니다.
+- 추가 수정: 접속 시 백로그 확인에서 결과가 없을 경우 `UNSEEN` 메일 최신 스캔 보조 경로를 추가했습니다.
+- 신규 env: `GMAIL_LIVE_POLL_FALLBACK_SEC` (기본 20초)
+- 추가 수정: Gmail 프로액티브 알림을 라이브컨텍스트 주입 방식에서 `직접 user turn 전송` 방식으로 변경해 실제 음성 응답 트리거를 강화했습니다.
+- 추가 수정: IDLE 대기 구간에 하드 타임아웃(`asyncio.wait_for`)을 추가해 블로킹 시 fallback poll로 넘어가도록 보강했습니다.
+- 추가 로그: 백로그 긴급 감지 건수(`backlog urgent detected: N`) 출력.
+- 추가 개선: Gmail 긴급 판정 LLM 응답에서 `tone`(urgent/celebratory/empathetic/neutral), `style`를 함께 받아 알림 발화 톤을 동적으로 반영하도록 변경.
+- 서버 프로액티브 발화 함수 `_send_proactive_announcement`에 tone/style 인자를 추가하고 톤별 가이드 문구를 적용.
+- 백로그 알림은 여러 건을 합쳐 읽지 않고, 메일별 tone을 보존해 최대 2건 개별 안내하도록 변경.
+- 추가 수정: 프로액티브 메일 알림 전/후 `response_guard` 및 `transit_turn_gate`를 강제 초기화하는 `_reset_response_gate()`를 추가했습니다.
+- 목적: 메일 알림 후 후속 사용자 발화가 막히는(무응답) 상태를 방지.

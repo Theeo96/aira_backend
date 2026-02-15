@@ -24,6 +24,8 @@ from openai import AzureOpenAI
 from modules.cosmos_db import cosmos_service
 from modules.memory import memory_service
 from modules.seoul_info_module import build_seoul_info_packet, build_speech_summary
+from modules.news_agent import NewsAgent
+from modules.gmail_alert_module import GmailAlertModule
 
 from contextlib import asynccontextmanager
 
@@ -68,8 +70,24 @@ AZURE_OPENAI_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
 INTENT_ROUTER_MODEL = os.getenv("INTENT_ROUTER_MODEL") or AZURE_OPENAI_DEPLOYMENT_NAME or "gpt-4o-mini"
 ENABLE_TRANSIT_FILLER = os.getenv("ENABLE_TRANSIT_FILLER", "false").strip().lower() in {"1", "true", "yes", "on"}
 STT_SEGMENTATION_SILENCE_TIMEOUT_MS = os.getenv("STT_SEGMENTATION_SILENCE_TIMEOUT_MS", "280")
+GMAIL_POLL_INTERVAL_SEC = float(os.getenv("GMAIL_POLL_INTERVAL_SEC", "60"))
+GMAIL_ALERT_BIND_USER = os.getenv("GMAIL_ALERT_BIND_USER", "true").strip().lower() in {"1", "true", "yes", "on"}
+GMAIL_IDLE_TIMEOUT_SEC = float(os.getenv("GMAIL_IDLE_TIMEOUT_SEC", "120"))
+GMAIL_LIVE_POLL_FALLBACK_SEC = float(os.getenv("GMAIL_LIVE_POLL_FALLBACK_SEC", "20"))
 print(f"[Config] ENABLE_TRANSIT_FILLER={ENABLE_TRANSIT_FILLER}")
 print(f"[Config] GEMINI_DIRECT_AUDIO_INPUT={GEMINI_DIRECT_AUDIO_INPUT}")
+
+try:
+    NEWS_AGENT = NewsAgent()
+except Exception as e:
+    NEWS_AGENT = None
+    print(f"[News] NewsAgent init failed: {e}")
+
+try:
+    GMAIL_ALERT = GmailAlertModule()
+except Exception as e:
+    GMAIL_ALERT = None
+    print(f"[GmailAlert] init failed: {e}")
 
 
 class IntentRouter:
@@ -95,6 +113,8 @@ class IntentRouter:
 
     def _fallback(self, text: str):
         t = str(text or "")
+        if any(k in t for k in ["뉴스", "헤드라인", "속보", "기사"]):
+            return {"intent": "news", "destination": _extract_destination_from_text(t), "source": "fallback", "home_update": False}
         if any(k in t for k in ["지하철", "역", "방면", "열차", "몇 분"]):
             return {"intent": "subway_route", "destination": _extract_destination_from_text(t), "source": "fallback", "home_update": False}
         if any(k in t for k in ["버스", "정류장"]):
@@ -111,7 +131,7 @@ class IntentRouter:
         system = (
             "Classify Korean commuter query intent. Return JSON only with keys: "
             "intent, destination, home_update. intent one of "
-            "[subway_route,bus_route,weather,air_quality,commute_overview,general]. "
+            "[subway_route,bus_route,weather,air_quality,news,commute_overview,general]. "
             "destination should be a concise place/station name or null. "
             "home_update must be true only when the user explicitly indicates home relocation/change "
             "(e.g., moved house, changed home location, says 'my home is now ...'). "
@@ -131,7 +151,7 @@ class IntentRouter:
             intent = data.get("intent") if isinstance(data, dict) else None
             destination = data.get("destination") if isinstance(data, dict) else None
             home_update = bool(data.get("home_update")) if isinstance(data, dict) else False
-            if intent not in {"subway_route", "bus_route", "weather", "air_quality", "commute_overview", "general"}:
+            if intent not in {"subway_route", "bus_route", "weather", "air_quality", "news", "commute_overview", "general"}:
                 return self._fallback(text)
             return {"intent": intent, "destination": destination, "source": "llm", "home_update": home_update}
         except Exception as e:
@@ -208,6 +228,40 @@ def _extract_destination_from_text(text: str):
         if cand:
             return cand
     return None
+
+
+def _extract_news_topic_from_text(text: str):
+    t = str(text or "").strip()
+    if not t:
+        return None
+    # Remove common trailing question/filler phrases.
+    t = re.sub(r"(알려줘|말해줘|보여줘|찾아줘|브리핑|요약|어때|뭐야|줘)$", "", t).strip()
+    t = re.sub(r"(오늘|지금|최신)\s*", "", t).strip()
+    t = re.sub(r"(뉴스|헤드라인|속보|기사)", "", t).strip()
+    t = re.sub(r"\s+", " ", t)
+    return t if t else None
+
+
+def _get_news_headlines(topic: str | None, limit: int = 3):
+    if NEWS_AGENT is None:
+        return []
+    query = str(topic or "").strip() or "최신 뉴스"
+    try:
+        items = NEWS_AGENT._search_naver_news(query, display=max(limit, 5))
+    except Exception as e:
+        print(f"[News] fetch failed: {e}")
+        return []
+    headlines = []
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or "").strip()
+            if title:
+                headlines.append(title)
+            if len(headlines) >= limit:
+                break
+    return headlines
 
 
 def _is_vision_related_query(text: str) -> bool:
@@ -888,7 +942,36 @@ def _execute_tools_for_intent(
     lng: float | None,
     destination_name: str | None,
     env_cache: dict | None = None,
+    user_text: str | None = None,
 ):
+    if intent == "news":
+        topic = _extract_news_topic_from_text(user_text) or str(destination_name or "").strip() or "최신 뉴스"
+        headlines = _get_news_headlines(topic=topic, limit=3)
+        if headlines:
+            summary = f"{topic} 기준 최신 뉴스입니다. " + " / ".join([f"{idx+1}. {h}" for idx, h in enumerate(headlines)])
+        else:
+            summary = "뉴스 데이터를 현재 받지 못했어요."
+        return {
+            "station": None,
+            "arrivals": [],
+            "speechSummary": summary,
+            "firstEtaMinutes": None,
+            "nextEtaMinutes": None,
+            "walkToStationMinutes": None,
+            "walkToBusStopMinutes": None,
+            "decision": "unknown",
+            "busStopName": None,
+            "busNumbers": [],
+            "firstMode": None,
+            "firstDirection": None,
+            "weather": {},
+            "air": {},
+            "news": {"topic": topic, "headlines": headlines},
+            "homeConfigured": False,
+            "destinationName": destination_name,
+            "destinationRequested": bool(destination_name),
+        }
+
     # Weather/Air intents should not trigger ODSAY route/station calls.
     if intent in {"weather", "air_quality"}:
         weather = {}
@@ -1110,7 +1193,7 @@ async def audio_websocket(ws: WebSocket):
     # Inject Memory into System Instruction
     system_instruction = (
         "You are Aira, a warm and practical Korean voice assistant. "
-        "For transit/city/weather/air-quality topics, never fabricate facts. "
+        "For transit/city/weather/air-quality/news topics, never fabricate facts. "
         "Only state information that is explicitly present in provided live context. "
         "If required data is missing, say what is missing and ask one concise follow-up question. "
         "For subway guidance, include departure station, line/direction, ETA, walking minutes, and whether to take current or next train only when present in live context. "
@@ -1169,6 +1252,7 @@ async def audio_websocket(ws: WebSocket):
     # Track Full Transcript for Summarization
     session_transcript = []
     route_dedupe = {"text": "", "ts": 0.0}
+    user_activity = {"last_user_ts": time.monotonic()}
     transit_turn_gate = {"until": 0.0}
     response_guard = {
         "active": False,
@@ -1178,6 +1262,17 @@ async def audio_websocket(ws: WebSocket):
         "block_direct_audio_until": 0.0,
         "forced_intent_turn": None,
     }
+
+    def _reset_response_gate(reason: str = ""):
+        response_guard["active"] = False
+        response_guard["context_sent"] = False
+        response_guard["suppressed_audio_seen"] = False
+        response_guard["block_direct_audio"] = False
+        response_guard["block_direct_audio_until"] = 0.0
+        response_guard["forced_intent_turn"] = None
+        transit_turn_gate["until"] = 0.0
+        if reason:
+            print(f"[Guard] reset: {reason}")
 
     async def _inject_live_context_now(context_text: str, complete_turn: bool = False):
         session_obj = session_ref.get("obj")
@@ -1210,6 +1305,31 @@ async def audio_websocket(ws: WebSocket):
             ],
             turn_complete=True,
         )
+
+    async def _send_proactive_announcement(summary_text: str, tone: str = "neutral", style: str = ""):
+        msg = str(summary_text or "").strip()
+        if not msg:
+            return
+        # Proactive branch must not leave previous turn guards armed.
+        _reset_response_gate("before proactive email alert")
+        tone_key = str(tone or "neutral").strip().lower()
+        tone_guide = {
+            "urgent": "톤은 차분하지만 단호하게, 핵심부터 먼저 말해주세요.",
+            "celebratory": "톤은 밝고 축하하는 느낌으로, 과장 없이 따뜻하게 말해주세요.",
+            "empathetic": "톤은 공감적이고 부드럽게, 위로가 되도록 조심스럽게 말해주세요.",
+            "neutral": "톤은 자연스럽고 담백하게 말해주세요.",
+        }.get(tone_key, "톤은 자연스럽고 담백하게 말해주세요.")
+        style_hint = str(style or "").strip()
+        # Use a direct user turn so Gemini is forced to produce an audible response.
+        await _send_user_text_turn(
+            "[PROACTIVE_ALERT] 아래 내용을 사용자에게 한 문장으로 자연스럽게 알려주세요. "
+            + tone_guide + " "
+            + (f"추가 스타일 힌트: {style_hint}. " if style_hint else "")
+            + "바로 음성으로 안내하고, 끝에 '원하시면 요약해드릴게요' 정도만 덧붙여주세요. "
+            + msg
+        )
+        # Ensure subsequent user audio is not blocked after proactive turn.
+        _reset_response_gate("after proactive email alert")
 
     async def _inject_initial_location_context():
         if client_state.get("lat") is None or client_state.get("lng") is None:
@@ -1296,6 +1416,7 @@ async def audio_websocket(ws: WebSocket):
 
             if role == "user":
                 try:
+                    user_activity["last_user_ts"] = time.monotonic()
                     if _is_vision_related_query(text):
                         snapshot_bytes = camera_state.get("latest_snapshot")
                         snapshot_ts = float(camera_state.get("snapshot_ts") or 0.0)
@@ -1369,7 +1490,7 @@ async def audio_websocket(ws: WebSocket):
                             print(f"[Profile] Home destination updated in-session: {home_candidate}")
 
                     live_summary = None
-                    routing_intents = {"subway_route", "bus_route", "commute_overview", "weather", "air_quality"}
+                    routing_intents = {"subway_route", "bus_route", "commute_overview", "weather", "air_quality", "news"}
                     should_inject_live = intent in routing_intents
 
                     if should_inject_live:
@@ -1426,6 +1547,7 @@ async def audio_websocket(ws: WebSocket):
                             lng=client_state.get("lng"),
                             destination_name=context_destination,
                             env_cache=env_cache,
+                            user_text=text,
                         )
                         live_summary = live_data.get("speechSummary") if isinstance(live_data, dict) else None
                         print(
@@ -1462,7 +1584,7 @@ async def audio_websocket(ws: WebSocket):
                         ctx_text = f"[INTENT:{intent or 'commute_overview'}] {str(live_summary)}"
                         if guidance:
                             ctx_text += " [GUIDE] " + " ".join(guidance)
-                        context_priority_intents = {"subway_route", "bus_route", "commute_overview", "weather", "air_quality"}
+                        context_priority_intents = {"subway_route", "bus_route", "commute_overview", "weather", "air_quality", "news"}
                         if intent in context_priority_intents:
                             ctx_text += (
                                 " [ACTION] Respond to the user's latest request now using this context. "
@@ -1718,13 +1840,88 @@ async def audio_websocket(ws: WebSocket):
                 except Exception as e:
                     print(f"[Server] Smart Flush Error: {e}")
 
+            async def gmail_alert_loop():
+                if not GMAIL_ALERT or (not GMAIL_ALERT.enabled):
+                    return
+                if GMAIL_ALERT_BIND_USER:
+                    bound = str(getattr(GMAIL_ALERT, "user", "") or "").strip().lower()
+                    if bound and str(user_id).strip().lower() != bound:
+                        print(f"[GmailAlert] skipped: connected user {user_id} does not match bound gmail user")
+                        return
+                print(f"[GmailAlert] loop started (idle_timeout={GMAIL_IDLE_TIMEOUT_SEC}s, user={user_id})")
+                try:
+                    # 1) Backlog check: previous disconnect ~ current connect
+                    backlog_alerts = await asyncio.to_thread(GMAIL_ALERT.begin_session, user_id, time.time())
+                    if backlog_alerts:
+                        sent = 0
+                        for alert in backlog_alerts[:2]:
+                            summary = str(alert.get("summary") or "").strip()
+                            if not summary:
+                                continue
+                            tone = str(alert.get("tone") or "neutral")
+                            style = str(alert.get("style") or "")
+                            sent += 1
+                            await _send_proactive_announcement(summary, tone=tone, style=style)
+                        if sent > 0:
+                            print(f"[GmailAlert] backlog urgent detected: {sent}")
+                            user_activity["last_user_ts"] = time.monotonic()
+                    else:
+                        print("[GmailAlert] backlog urgent detected: 0")
+
+                    while True:
+                        # Don't interrupt active user turn.
+                        if (time.monotonic() - float(user_activity.get("last_user_ts") or 0.0)) < 5.0:
+                            await asyncio.sleep(1.0)
+                            continue
+                        if response_guard.get("active"):
+                            await asyncio.sleep(1.0)
+                            continue
+
+                        try:
+                            alerts = await asyncio.wait_for(
+                                asyncio.to_thread(
+                                    GMAIL_ALERT.wait_next_live_alert,
+                                    user_id,
+                                    GMAIL_IDLE_TIMEOUT_SEC,
+                                    1,
+                                ),
+                                timeout=GMAIL_IDLE_TIMEOUT_SEC + 8.0,
+                            )
+                        except asyncio.TimeoutError:
+                            print("[GmailAlert] idle wait hard-timeout, using fallback poll")
+                            alerts = []
+                        # IDLE 신호를 못 받는 환경 대비 폴링 fallback
+                        if not alerts:
+                            alerts = await asyncio.to_thread(GMAIL_ALERT.poll_live_alerts, user_id, 1)
+                        if alerts:
+                            alert = alerts[0]
+                            summary = str(alert.get("summary") or "").strip()
+                            if summary:
+                                print(f"[GmailAlert] urgent mail detected: {summary}")
+                                await _send_proactive_announcement(
+                                    summary,
+                                    tone=str(alert.get("tone") or "neutral"),
+                                    style=str(alert.get("style") or ""),
+                                )
+                                user_activity["last_user_ts"] = time.monotonic()
+                        else:
+                            print("[GmailAlert] idle wait timeout/no urgent mail")
+                        await asyncio.sleep(max(1.0, GMAIL_LIVE_POLL_FALLBACK_SEC))
+                except asyncio.CancelledError:
+                    return
+                except Exception as e:
+                    print(f"[GmailAlert] loop error: {e}")
+
             # Run tasks
+            tasks = [
+                asyncio.create_task(receive_from_client()),
+                asyncio.create_task(send_to_client()),
+                asyncio.create_task(smart_flush_injector()),
+            ]
+            if GMAIL_ALERT and GMAIL_ALERT.enabled:
+                tasks.append(asyncio.create_task(gmail_alert_loop()))
             done, pending = await asyncio.wait(
-                [
-                    asyncio.create_task(receive_from_client()), 
-                    asyncio.create_task(send_to_client()),
-                    asyncio.create_task(smart_flush_injector())
-                ],
+                tasks,
                 return_when=asyncio.FIRST_COMPLETED
             )
             for task in pending: task.cancel()
@@ -1734,6 +1931,11 @@ async def audio_websocket(ws: WebSocket):
     finally:
         # Cleanup
         session_ref["obj"] = None
+        if GMAIL_ALERT and GMAIL_ALERT.enabled:
+            try:
+                await asyncio.to_thread(GMAIL_ALERT.end_session, user_id, time.time())
+            except Exception as e:
+                print(f"[GmailAlert] end_session failed: {e}")
         print("[Server] Cleaning up resources...")
         try:
             # Execute cleanup asynchronously with TIMEOUT to avoid blocking the Event Loop
