@@ -1931,3 +1931,16 @@
 - 백로그 알림은 여러 건을 합쳐 읽지 않고, 메일별 tone을 보존해 최대 2건 개별 안내하도록 변경.
 - 추가 수정: 프로액티브 메일 알림 전/후 `response_guard` 및 `transit_turn_gate`를 강제 초기화하는 `_reset_response_gate()`를 추가했습니다.
 - 목적: 메일 알림 후 후속 사용자 발화가 막히는(무응답) 상태를 방지.
+
+## 2026-02-15 - 정리 브랜치 1차 클린업 (미사용 파일 제거)
+- 브랜치: `mun-cleanup-server`
+- 목적: main 병합 시 충돌/혼선 최소화를 위해 현재 실행 경로에서 미사용 파일 제거.
+
+### 제거 파일
+- `backend/aira_main_updated.py` (실험용 대체 엔트리, 현재 run 경로 미사용)
+- `backend/module_manager.py` (뉴스 실험 경로용, 현재 서버 런타임 미사용)
+- `test_news_agent.py` (로컬 테스트 스크립트, 배포 경로 미사용)
+- `works_aira.txt` (작업 메모 파일)
+
+### 영향
+- `start_services.bat -> backend/run_server.py -> backend/server.py` 실행 경로에는 영향 없음.
