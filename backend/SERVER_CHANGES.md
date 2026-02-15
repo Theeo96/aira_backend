@@ -1964,3 +1964,22 @@
 ### 영향
 - 기능 동작은 동일 유지
 - `server.py` 상단 대형 클래스 블록 제거로 충돌면적 축소
+
+## 2026-02-15 - server.py cleanup step 3 (SeoulLiveService module split)
+- branch: `mun-cleanup-server`
+- purpose: reduce `server.py` merge conflict surface by moving intent-specific live context composition into modules.
+
+### changes
+- added: `backend/modules/seoul_live_service.py`
+  - added `SeoulLiveService` class.
+  - handles intent-specific execution for `news`, `weather`, `air_quality`, and transit intents.
+  - uses callback injection for dependencies from `server.py`.
+- updated: `backend/server.py`
+  - added `from modules.seoul_live_service import SeoulLiveService`
+  - initialized `seoul_live_service = SeoulLiveService(...)` after live summary helpers are defined.
+  - replaced `_execute_tools_for_intent` body with delegation to module method.
+  - removed duplicated inline branching logic from `server.py`.
+
+### impact
+- runtime behavior remains equivalent (routing path refactored only).
+- large intent branching block removed from `server.py`, reducing future merge conflicts.
