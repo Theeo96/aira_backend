@@ -1983,3 +1983,20 @@
 ### impact
 - runtime behavior remains equivalent (routing path refactored only).
 - large intent branching block removed from `server.py`, reducing future merge conflicts.
+
+## 2026-02-15 - server.py cleanup step 4 (Gmail alert loop module split)
+- branch: `mun-cleanup-server`
+- purpose: remove long async Gmail alert loop block from `server.py` and reduce merge conflict surface.
+
+### changes
+- added: `backend/modules/gmail_alert_runner.py`
+  - added `run_gmail_alert_loop(...)` async runner.
+  - includes backlog check, live IDLE wait, fallback polling, urgency delivery trigger, and user-turn interruption guards.
+- updated: `backend/server.py`
+  - added `from modules.gmail_alert_runner import run_gmail_alert_loop`
+  - removed inline `gmail_alert_loop` definition.
+  - task creation now calls `run_gmail_alert_loop(...)` with injected dependencies.
+
+### impact
+- behavior preserved; orchestration moved to module.
+- `server.py` websocket section became shorter and easier to diff/merge.
