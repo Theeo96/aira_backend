@@ -9,6 +9,8 @@ import math
 import numpy as np
 import re
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from fastapi import Body, FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -28,6 +30,10 @@ from modules.gmail_alert_runner import run_gmail_alert_loop
 from modules.intent_router import IntentRouter
 from modules.seoul_live_service import SeoulLiveService
 from modules.vision_service import VisionService
+from modules.news_context_service import NewsContextService
+from modules.timer_service import TimerService
+from modules.proactive_service import ProactiveService
+from modules.ws_orchestrator_service import WsOrchestratorService
 
 from contextlib import asynccontextmanager
 
@@ -85,6 +91,9 @@ except Exception as e:
     NEWS_AGENT = None
     print(f"[News] NewsAgent init failed: {e}")
 
+news_context_service = NewsContextService(news_agent=NEWS_AGENT, log=print)
+ws_orchestrator = WsOrchestratorService()
+
 try:
     GMAIL_ALERT = GmailAlertModule()
 except Exception as e:
@@ -93,6 +102,11 @@ except Exception as e:
 
 
 intent_router = None
+
+
+def _now_kst_text():
+    now = datetime.now(ZoneInfo("Asia/Seoul"))
+    return now.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _http_get_json(url: str, timeout: int = 6):
@@ -170,37 +184,31 @@ intent_router = IntentRouter(
 
 
 def _extract_news_topic_from_text(text: str):
-    t = str(text or "").strip()
-    if not t:
-        return None
-    # Remove common trailing question/filler phrases.
-    t = re.sub(r"(알려줘|말해줘|보여줘|찾아줘|브리핑|요약|어때|뭐야|줘)$", "", t).strip()
-    t = re.sub(r"(오늘|지금|최신)\s*", "", t).strip()
-    t = re.sub(r"(뉴스|헤드라인|속보|기사)", "", t).strip()
-    t = re.sub(r"\s+", " ", t)
-    return t if t else None
+    return news_context_service.extract_topic(text)
 
 
 def _get_news_headlines(topic: str | None, limit: int = 3):
-    if NEWS_AGENT is None:
-        return []
-    query = str(topic or "").strip() or "최신 뉴스"
-    try:
-        items = NEWS_AGENT._search_naver_news(query, display=max(limit, 5))
-    except Exception as e:
-        print(f"[News] fetch failed: {e}")
-        return []
-    headlines = []
-    if isinstance(items, list):
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            title = str(item.get("title") or "").strip()
-            if title:
-                headlines.append(title)
-            if len(headlines) >= limit:
-                break
-    return headlines
+    return news_context_service.get_headlines(topic=topic, limit=limit)
+
+
+def _get_news_items(topic: str | None, limit: int = 3):
+    return news_context_service.get_items(topic=topic, limit=limit)
+
+
+def _is_news_detail_query(text: str) -> bool:
+    return news_context_service.is_detail_query(text)
+
+
+def _is_news_followup_query(text: str) -> bool:
+    return news_context_service.is_followup_query(text)
+
+
+def _select_news_item_by_text(text: str, items: list[dict]):
+    return news_context_service.select_item_by_text(text=text, items=items)
+
+
+def _build_news_detail_summary(item: dict) -> str:
+    return news_context_service.build_detail_summary(item)
 
 
 def _is_vision_related_query(text: str) -> bool:
@@ -885,6 +893,7 @@ seoul_live_service = SeoulLiveService(
     is_env_cache_fresh=_is_env_cache_fresh,
     extract_news_topic=_extract_news_topic_from_text,
     get_news_headlines=_get_news_headlines,
+    get_news_items=_get_news_items,
 )
 
 
@@ -980,6 +989,7 @@ async def audio_websocket(ws: WebSocket):
         "asked_once": False,
     }
     env_cache = {"weather": {}, "air": {}, "lat": current_lat, "lng": current_lng, "ts": 0.0}
+    news_state = {"topic": "", "items": [], "selected": None, "ts": 0.0}
 
     # Inject Memory into System Instruction
     system_instruction = (
@@ -1040,6 +1050,7 @@ async def audio_websocket(ws: WebSocket):
     # Track Full Transcript for Summarization
     session_transcript = []
     route_dedupe = {"text": "", "ts": 0.0}
+    timer_set_dedupe = {"key": "", "ts": 0.0}
     user_activity = {"last_user_ts": time.monotonic()}
     transit_turn_gate = {"until": 0.0}
     speech_capture_gate = {"until": 0.0}
@@ -1051,17 +1062,6 @@ async def audio_websocket(ws: WebSocket):
         "block_direct_audio_until": 0.0,
         "forced_intent_turn": None,
     }
-
-    def _reset_response_gate(reason: str = ""):
-        response_guard["active"] = False
-        response_guard["context_sent"] = False
-        response_guard["suppressed_audio_seen"] = False
-        response_guard["block_direct_audio"] = False
-        response_guard["block_direct_audio_until"] = 0.0
-        response_guard["forced_intent_turn"] = None
-        transit_turn_gate["until"] = 0.0
-        if reason:
-            print(f"[Guard] reset: {reason}")
 
     async def _inject_live_context_now(context_text: str, complete_turn: bool = False):
         session_obj = session_ref.get("obj")
@@ -1081,6 +1081,33 @@ async def audio_websocket(ws: WebSocket):
             turn_complete=complete_turn,
         )
 
+    proactive_service = ProactiveService(
+        response_guard=response_guard,
+        transit_turn_gate=transit_turn_gate,
+        inject_live_context_now=_inject_live_context_now,
+        log=print,
+    )
+
+    def _reset_response_gate(reason: str = ""):
+        proactive_service.reset_response_gate(reason)
+
+    async def _request_spoken_response_with_context(
+        intent_tag: str,
+        context_summary: str,
+        action_instruction: str,
+        tone: str = "neutral",
+        style: str = "",
+        complete_turn: bool = True,
+    ):
+        await proactive_service.request_spoken_response_with_context(
+            intent_tag=intent_tag,
+            context_summary=context_summary,
+            action_instruction=action_instruction,
+            tone=tone,
+            style=style,
+            complete_turn=complete_turn,
+        )
+
     async def _send_user_text_turn(user_text: str):
         session_obj = session_ref.get("obj")
         if not session_obj:
@@ -1095,30 +1122,36 @@ async def audio_websocket(ws: WebSocket):
             turn_complete=True,
         )
 
-    async def _send_proactive_announcement(summary_text: str, tone: str = "neutral", style: str = ""):
-        msg = str(summary_text or "").strip()
-        if not msg:
-            return
-        # Proactive branch must not leave previous turn guards armed.
-        _reset_response_gate("before proactive email alert")
-        tone_key = str(tone or "neutral").strip().lower()
-        tone_guide = {
-            "urgent": "톤은 차분하지만 단호하게, 핵심부터 먼저 말해주세요.",
-            "celebratory": "톤은 밝고 축하하는 느낌으로, 과장 없이 따뜻하게 말해주세요.",
-            "empathetic": "톤은 공감적이고 부드럽게, 위로가 되도록 조심스럽게 말해주세요.",
-            "neutral": "톤은 자연스럽고 담백하게 말해주세요.",
-        }.get(tone_key, "톤은 자연스럽고 담백하게 말해주세요.")
-        style_hint = str(style or "").strip()
-        # Use a direct user turn so Gemini is forced to produce an audible response.
-        await _send_user_text_turn(
-            "[PROACTIVE_ALERT] 아래 내용을 사용자에게 한 문장으로 자연스럽게 알려주세요. "
-            + tone_guide + " "
-            + (f"추가 스타일 힌트: {style_hint}. " if style_hint else "")
-            + "바로 음성으로 안내하고, 끝에 '원하시면 요약해드릴게요' 정도만 덧붙여주세요. "
-            + msg
+    async def _send_proactive_announcement(
+        summary_text: str,
+        tone: str = "neutral",
+        style: str = "",
+        add_followup_hint: bool = True,
+    ):
+        await proactive_service.send_proactive_announcement(
+            summary_text=summary_text,
+            tone=tone,
+            style=style,
+            add_followup_hint=add_followup_hint,
         )
-        # Ensure subsequent user audio is not blocked after proactive turn.
-        _reset_response_gate("after proactive email alert")
+
+    async def _on_timer_fired(delay_sec: int):
+        if delay_sec >= 60:
+            amount = max(1, delay_sec // 60)
+            unit = "분"
+        else:
+            amount = delay_sec
+            unit = "초"
+        await _send_proactive_announcement(
+            f"요청하신 {amount}{unit}이 지났어요. 다시 이야기할까요?",
+            tone="neutral",
+            add_followup_hint=False,
+        )
+
+    timer_service = TimerService(
+        on_fire=_on_timer_fired,
+        log=print,
+    )
 
     async def _inject_initial_location_context():
         if client_state.get("lat") is None or client_state.get("lng") is None:
@@ -1179,6 +1212,20 @@ async def audio_websocket(ws: WebSocket):
             if role == "user":
                 try:
                     user_activity["last_user_ts"] = time.monotonic()
+                    speech_capture_gate["until"] = max(
+                        float(speech_capture_gate.get("until") or 0.0),
+                        time.monotonic() + 1.0,
+                    )
+                    now_text = _now_kst_text()
+                    if loop.is_running():
+                        asyncio.run_coroutine_threadsafe(
+                            _inject_live_context_now(
+                                f"[INTENT:time_context] Current Seoul time is {now_text} (KST, Asia/Seoul). Use this as 'now'.",
+                                complete_turn=False,
+                            ),
+                            loop,
+                        )
+
                     snapshot_bytes = vision_service.get_recent_snapshot_for_query(
                         text,
                         _is_vision_related_query,
@@ -1215,15 +1262,94 @@ async def audio_websocket(ws: WebSocket):
                     route_dedupe["text"] = normalized_user_text
                     route_dedupe["ts"] = now_ts
 
-                    route = intent_router.route(text)
+                    route = intent_router.route(text, active_timer=timer_service.has_active())
                     intent = route.get("intent") if isinstance(route, dict) else "commute_overview"
                     routed_dest = route.get("destination") if isinstance(route, dict) else None
                     routed_home_update = bool(route.get("home_update")) if isinstance(route, dict) else False
+                    routed_timer_seconds = route.get("timer_seconds") if isinstance(route, dict) else None
                     route_source = route.get("source") if isinstance(route, dict) else "fallback"
                     print(
                         f"[IntentRouter] source={route_source}, intent={intent}, "
-                        f"destination={routed_dest}, home_update={routed_home_update}"
+                        f"destination={routed_dest}, home_update={routed_home_update}, "
+                        f"timer_seconds={routed_timer_seconds}"
                     )
+                    if intent == "timer_cancel" and (not timer_service.has_active()):
+                        # Timer cancel intent is only meaningful while a timer is active.
+                        intent = "general"
+                    if intent == "timer_cancel" and timer_service.has_active():
+                        canceled = timer_service.cancel_all()
+                        asyncio.run_coroutine_threadsafe(
+                            _inject_live_context_now(
+                                f"[INTENT:timer_canceled] Canceled {canceled} active timer(s). "
+                                "Acknowledge cancellation briefly in Korean, then answer the user's current request directly.",
+                                complete_turn=True,
+                            ),
+                            loop,
+                        )
+                        # Let the same user utterance proceed naturally after cancel notice.
+                        # Do not run live-tool routing for this branch.
+                        return
+                    if intent == "timer" and loop.is_running():
+                        timer_sec = None
+                        try:
+                            timer_sec = int(routed_timer_seconds) if routed_timer_seconds is not None else None
+                        except Exception:
+                            timer_sec = None
+                        if timer_sec is not None and 5 <= timer_sec <= 21600:
+                            # Prevent duplicate "timer set" responses from near-duplicate STT finalization.
+                            timer_key = f"{timer_sec}:{normalized_user_text}"
+                            now_timer_ts = time.monotonic()
+                            if (
+                                timer_key
+                                and timer_key == str(timer_set_dedupe.get("key") or "")
+                                and (now_timer_ts - float(timer_set_dedupe.get("ts") or 0.0)) < 2.5
+                            ):
+                                print(f"[Timer] duplicate timer_set skipped: {timer_sec}s")
+                                return
+                            timer_set_dedupe["key"] = timer_key
+                            timer_set_dedupe["ts"] = now_timer_ts
+
+                            # Block stale parallel model response from the raw audio turn.
+                            response_guard["active"] = True
+                            response_guard["context_sent"] = True
+                            response_guard["suppressed_audio_seen"] = False
+                            response_guard["block_direct_audio"] = True
+                            response_guard["block_direct_audio_until"] = max(
+                                float(response_guard.get("block_direct_audio_until") or 0.0),
+                                time.monotonic() + 1.4,
+                            )
+                            transit_turn_gate["until"] = max(
+                                float(transit_turn_gate.get("until") or 0.0),
+                                time.monotonic() + 1.1,
+                            )
+                            asyncio.run_coroutine_threadsafe(
+                                timer_service.register(timer_sec),
+                                loop,
+                            )
+                            print(f"[Timer] timer_set accepted: {timer_sec}s")
+                        else:
+                            print("[Timer] timer_set rejected: invalid timer_seconds")
+                        return
+
+                    # News detail/follow-up inference from recently fetched news items.
+                    has_recent_news = (
+                        bool(news_state.get("items"))
+                        and (now_ts - float(news_state.get("ts") or 0.0)) < 900
+                    )
+                    if has_recent_news and intent in {"general", "news"}:
+                        wants_detail = _is_news_detail_query(text)
+                        wants_followup = _is_news_followup_query(text)
+                        if wants_detail or wants_followup:
+                            matched_item = _select_news_item_by_text(
+                                text=text,
+                                items=(news_state.get("items") or []),
+                            )
+                            if matched_item is None and wants_followup:
+                                matched_item = news_state.get("selected")
+                            if matched_item is not None:
+                                news_state["selected"] = matched_item
+                                intent = "news_detail" if wants_detail else "news_followup"
+
                     # LLM-first: only use regex destination extraction when fallback routing is active.
                     if route_source == "llm":
                         dest = routed_dest
@@ -1254,26 +1380,16 @@ async def audio_websocket(ws: WebSocket):
                             print(f"[Profile] Home destination updated in-session: {home_candidate}")
 
                     live_summary = None
-                    routing_intents = {"subway_route", "bus_route", "commute_overview", "weather", "air_quality", "news"}
+                    routing_intents = ws_orchestrator.ROUTING_INTENTS
                     should_inject_live = intent in routing_intents
 
                     if should_inject_live:
-                        env_intent = intent in {"weather", "air_quality"}
                         # Always gate response until live context is injected to prevent pre-context utterances.
-                        response_guard["active"] = True
-                        response_guard["context_sent"] = False
-                        response_guard["suppressed_audio_seen"] = False
-                        response_guard["block_direct_audio"] = True
-                        response_guard["block_direct_audio_until"] = time.monotonic() + (5.0 if env_intent else 4.0)
-                        response_guard["forced_intent_turn"] = intent
-                        # Transit intents keep output gate. Env intents should speak filler immediately.
-                        if not env_intent:
-                            transit_turn_gate["until"] = max(
-                                float(transit_turn_gate.get("until") or 0.0),
-                                time.monotonic() + 1.2,
-                            )
-                        else:
-                            transit_turn_gate["until"] = time.monotonic()
+                        ws_orchestrator.arm_live_response_gate(
+                            response_guard=response_guard,
+                            transit_turn_gate=transit_turn_gate,
+                            intent=intent,
+                        )
                         if client_state.get("lat") is not None and client_state.get("lng") is not None and loop.is_running():
                             asyncio.run_coroutine_threadsafe(
                                 _inject_live_context_now(
@@ -1303,17 +1419,47 @@ async def audio_websocket(ws: WebSocket):
                                 _inject_live_context_now(filler_text, complete_turn=True),
                                 loop,
                             )
-                        transit_intents = {"subway_route", "bus_route", "commute_overview"}
+                        transit_intents = ws_orchestrator.TRANSIT_INTENTS
                         context_destination = destination_state["name"] if intent in transit_intents else None
-                        live_data = _execute_tools_for_intent(
-                            intent=intent or "commute_overview",
-                            lat=client_state.get("lat"),
-                            lng=client_state.get("lng"),
-                            destination_name=context_destination,
-                            env_cache=env_cache,
-                            user_text=text,
-                        )
+                        if intent in {"news_detail", "news_followup"}:
+                            picked = news_state.get("selected")
+                            if picked is None and news_state.get("items"):
+                                picked = _select_news_item_by_text(text=text, items=(news_state.get("items") or []))
+                            if picked is None and news_state.get("items"):
+                                picked = (news_state.get("items") or [None])[0]
+                            if picked is not None:
+                                news_state["selected"] = picked
+                            detail_summary = _build_news_detail_summary(picked) if picked else "먼저 최신 뉴스를 불러온 뒤에, 관심 있는 키워드를 말해주시면 자세히 설명해드릴게요."
+                            live_data = {
+                                "speechSummary": detail_summary,
+                                "news": {
+                                    "topic": news_state.get("topic") or "",
+                                    "headlines": [str(i.get("title") or "").strip() for i in (news_state.get("items") or []) if isinstance(i, dict)],
+                                    "items": news_state.get("items") or [],
+                                    "selected": picked,
+                                },
+                            }
+                        else:
+                            live_data = _execute_tools_for_intent(
+                                intent=intent or "commute_overview",
+                                lat=client_state.get("lat"),
+                                lng=client_state.get("lng"),
+                                destination_name=context_destination,
+                                env_cache=env_cache,
+                                user_text=text,
+                            )
                         live_summary = live_data.get("speechSummary") if isinstance(live_data, dict) else None
+                        if intent == "news":
+                            news_meta = live_data.get("news") if isinstance(live_data, dict) else None
+                            if isinstance(news_meta, dict):
+                                news_state["topic"] = str(news_meta.get("topic") or "").strip()
+                                items = news_meta.get("items") or []
+                                if isinstance(items, list):
+                                    news_state["items"] = [i for i in items if isinstance(i, dict)]
+                                else:
+                                    news_state["items"] = []
+                                news_state["selected"] = None
+                                news_state["ts"] = time.monotonic()
                         print(
                             f"[SeoulInfo] live context built: intent={intent}, destination={context_destination}, "
                             f"summary_ok={bool(live_summary)}"
@@ -1345,29 +1491,25 @@ async def audio_websocket(ws: WebSocket):
                             else:
                                 live_summary = "경로 계산에 필요한 위치 좌표가 없습니다."
 
-                        ctx_text = f"[INTENT:{intent or 'commute_overview'}] {str(live_summary)}"
-                        if guidance:
-                            ctx_text += " [GUIDE] " + " ".join(guidance)
-                        context_priority_intents = {"subway_route", "bus_route", "commute_overview", "weather", "air_quality", "news"}
+                        context_priority_intents = ws_orchestrator.CONTEXT_PRIORITY_INTENTS
+                        context_summary = ws_orchestrator.merge_context_summary(
+                            live_summary=live_summary,
+                            guidance=guidance,
+                        )
+                        action_instruction = ws_orchestrator.build_action_instruction(intent)
+
                         if intent in context_priority_intents:
-                            ctx_text += (
-                                " [ACTION] Respond to the user's latest request now using this context. "
-                                "Give one concise final answer only. "
-                                "Do not add extra uncertainty/caveat sentences or follow-up questions after answering. "
-                                "Do not say you cannot provide realtime data unless the provided summary explicitly says data is missing. "
-                                "If summary exists, prioritize it and answer directly from it."
-                            )
                             # Keep gate a little longer while response turn is being finalized.
-                            transit_turn_gate["until"] = max(
-                                float(transit_turn_gate.get("until") or 0.0),
-                                time.monotonic() + 0.8,
-                            )
+                            ws_orchestrator.extend_post_context_gate(transit_turn_gate)
 
                         if loop.is_running():
                             asyncio.run_coroutine_threadsafe(
-                                _inject_live_context_now(
-                                    ctx_text,
-                                    complete_turn=intent in context_priority_intents,
+                                _request_spoken_response_with_context(
+                                    intent_tag=(intent or "commute_overview"),
+                                    context_summary=context_summary,
+                                    action_instruction=action_instruction,
+                                    tone="neutral",
+                                    complete_turn=(intent in context_priority_intents),
                                 ),
                                 loop,
                             )
@@ -1651,6 +1793,7 @@ async def audio_websocket(ws: WebSocket):
             except Exception as e:
                 print(f"[GmailAlert] end_session failed: {e}")
         print("[Server] Cleaning up resources...")
+        await timer_service.shutdown()
         try:
             # Execute cleanup asynchronously with TIMEOUT to avoid blocking the Event Loop
             # If Azure takes too long to stop, we just abandon it to prevent "Waiting for child process" hang.

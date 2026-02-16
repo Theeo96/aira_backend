@@ -1,4 +1,4 @@
-import time
+﻿import time
 from typing import Callable, Optional
 
 
@@ -14,6 +14,7 @@ class SeoulLiveService:
         is_env_cache_fresh: Callable[[dict | None, float | None, float | None], bool],
         extract_news_topic: Optional[Callable[[str], str | None]] = None,
         get_news_headlines: Optional[Callable[[str | None, int], list]] = None,
+        get_news_items: Optional[Callable[[str | None, int], list]] = None,
     ):
         self.default_destination = default_destination
         self.normalize_place_name = normalize_place_name
@@ -24,6 +25,7 @@ class SeoulLiveService:
         self.is_env_cache_fresh = is_env_cache_fresh
         self.extract_news_topic = extract_news_topic
         self.get_news_headlines = get_news_headlines
+        self.get_news_items = get_news_items
 
     def execute_tools_for_intent(
         self,
@@ -40,13 +42,26 @@ class SeoulLiveService:
                 topic = str(self.extract_news_topic(user_text or "") or "").strip()
             if not topic:
                 topic = str(destination_name or "").strip() or "최신 뉴스"
+
+            news_items = []
+            if self.get_news_items:
+                news_items = self.get_news_items(topic=topic, limit=3) or []
+
             headlines = []
             if self.get_news_headlines:
                 headlines = self.get_news_headlines(topic=topic, limit=3) or []
+            if (not headlines) and news_items:
+                for item in news_items:
+                    if isinstance(item, dict):
+                        title = str(item.get("title") or "").strip()
+                        if title:
+                            headlines.append(title)
+
             if headlines:
                 summary = f"{topic} 기준 최신 뉴스입니다. " + " / ".join([f"{idx+1}. {h}" for idx, h in enumerate(headlines)])
             else:
-                summary = "뉴스 데이터를 현재 받지 못했어요."
+                summary = "뉴스 데이터를 현재 받을 수 없습니다."
+
             return {
                 "station": None,
                 "arrivals": [],
@@ -62,7 +77,7 @@ class SeoulLiveService:
                 "firstDirection": None,
                 "weather": {},
                 "air": {},
-                "news": {"topic": topic, "headlines": headlines},
+                "news": {"topic": topic, "headlines": headlines, "items": news_items},
                 "homeConfigured": False,
                 "destinationName": destination_name,
                 "destinationRequested": bool(destination_name),
@@ -88,6 +103,7 @@ class SeoulLiveService:
                     env_cache["lat"] = lat
                     env_cache["lng"] = lng
                     env_cache["ts"] = time.monotonic()
+
             live = {
                 "station": None,
                 "arrivals": [],
@@ -109,6 +125,7 @@ class SeoulLiveService:
                 "envCacheFresh": cache_fresh,
                 "envCacheTs": cache_ts,
             }
+
             parts = []
             if intent == "weather":
                 w = live.get("weather") or {}
@@ -126,7 +143,7 @@ class SeoulLiveService:
                 if pop is not None:
                     parts.append(f"강수확률은 약 {int(pop)}%입니다.")
                 if rain is not None or precip is not None:
-                    parts.append(f"강수는 현재 약 {rain or precip}mm 수준입니다.")
+                    parts.append(f"강수량은 현재 약 {rain or precip}mm 수준입니다.")
                 if sky:
                     parts.append(f"하늘 상태는 {sky}입니다.")
                 if not parts:
@@ -136,13 +153,14 @@ class SeoulLiveService:
                 if a.get("usAqi") is not None:
                     parts.append(f"현재 대기질은 US AQI {a.get('usAqi')}입니다.")
                 if a.get("grade"):
-                    parts.append(f"수준은 {a.get('grade')}입니다.")
+                    parts.append(f"등급은 {a.get('grade')}입니다.")
                 if a.get("pm25") is not None:
                     parts.append(f"초미세먼지는 {a.get('pm25')}입니다.")
                 if a.get("pm10") is not None:
                     parts.append(f"미세먼지는 {a.get('pm10')}입니다.")
                 if not parts:
                     parts.append("대기질 데이터를 현재 받지 못했어요.")
+
             live["speechSummary"] = " ".join([p for p in parts if p]).strip()
             return live
 
