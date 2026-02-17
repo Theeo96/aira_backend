@@ -84,6 +84,7 @@ class GmailAlertModule:
         self.debug = os.getenv("GMAIL_ALERT_DEBUG", "false").strip().lower() in {"1", "true", "yes", "on"}
 
         self._llm_warned = False
+        self._llm_debug_count = 0
         self.llm_client = self._build_llm_client()
 
         self.state_file = os.path.join(os.path.dirname(__file__), "gmail_alert_state.json")
@@ -95,6 +96,14 @@ class GmailAlertModule:
             self.live_poll_fallback_sec = float(os.getenv("GMAIL_LIVE_POLL_FALLBACK_SEC", "20"))
         except Exception:
             self.live_poll_fallback_sec = 20.0
+        try:
+            self.backlog_scan_limit = int(os.getenv("GMAIL_BACKLOG_SCAN_LIMIT", "40"))
+        except Exception:
+            self.backlog_scan_limit = 40
+        try:
+            self.live_scan_limit = int(os.getenv("GMAIL_LIVE_SCAN_LIMIT", "25"))
+        except Exception:
+            self.live_scan_limit = 25
 
     @property
     def enabled(self) -> bool:
@@ -194,10 +203,13 @@ class GmailAlertModule:
                 tone = self._tone_hint(subject, body)
             decision = urgent and conf >= self.llm_threshold
             if self.debug:
-                print(
-                    f"[GmailAlert] llm decision={decision} conf={conf:.2f} threshold={self.llm_threshold:.2f} "
-                    f"tone={tone} reason={reason}"
-                )
+                self._llm_debug_count += 1
+                # Throttle noisy non-urgent logs to avoid flooding console during backlog scans.
+                if decision or (self._llm_debug_count % 20 == 0):
+                    print(
+                        f"[GmailAlert] llm decision={decision} conf={conf:.2f} threshold={self.llm_threshold:.2f} "
+                        f"tone={tone} reason={reason}"
+                    )
             return (decision, conf, reason, tone, style)
         except Exception as e:
             return (False, 0.0, f"llm_error:{e}", self._tone_hint(subject, body), "")
@@ -380,10 +392,14 @@ class GmailAlertModule:
         self.session_poll_from[uid] = now_ts
         if start_ts > now_ts:
             start_ts = now_ts - 60.0
-        alerts = self._fetch_messages_between(start_ts=start_ts, end_ts=now_ts, max_scan=120)
+        alerts = self._fetch_messages_between(
+            start_ts=start_ts,
+            end_ts=now_ts,
+            max_scan=max(10, int(self.backlog_scan_limit)),
+        )
         # 보완: 시간 헤더 이슈로 window 필터에서 빠진 UNSEEN 긴급 메일도 한 번 더 확인
         if not alerts:
-            fallback_alerts = self._fetch_unseen_recent(max_scan=60)
+            fallback_alerts = self._fetch_unseen_recent(max_scan=max(10, int(self.live_scan_limit)))
             if fallback_alerts:
                 alerts = fallback_alerts
         return alerts
@@ -392,7 +408,11 @@ class GmailAlertModule:
         uid = str(user_id or "").strip().lower()
         now_ts = time.time()
         start_ts = float(self.session_poll_from.get(uid, now_ts - 120.0))
-        alerts = self._fetch_messages_between(start_ts=start_ts, end_ts=now_ts, max_scan=100)
+        alerts = self._fetch_messages_between(
+            start_ts=start_ts,
+            end_ts=now_ts,
+            max_scan=max(10, int(self.live_scan_limit)),
+        )
         self.session_poll_from[uid] = now_ts
         if max_alerts and len(alerts) > max_alerts:
             return alerts[:max_alerts]
@@ -455,7 +475,11 @@ class GmailAlertModule:
         if not exists_event:
             return []
 
-        alerts = self._fetch_messages_between(start_ts=start_ts, end_ts=end_ts, max_scan=120)
+        alerts = self._fetch_messages_between(
+            start_ts=start_ts,
+            end_ts=end_ts,
+            max_scan=max(10, int(self.live_scan_limit)),
+        )
         if max_alerts and len(alerts) > max_alerts:
             return alerts[:max_alerts]
         return alerts

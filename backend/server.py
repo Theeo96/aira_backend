@@ -59,6 +59,8 @@ app.add_middleware(
 API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL_NAME = "gemini-2.5-flash-native-audio-preview-12-2025"
 GEMINI_DIRECT_AUDIO_INPUT = os.getenv("GEMINI_DIRECT_AUDIO_INPUT", "true").strip().lower() in {"1", "true", "yes", "on"}
+ORCHESTRATION_SINGLE_PATH = os.getenv("ORCHESTRATION_SINGLE_PATH", "true").strip().lower() in {"1", "true", "yes", "on"}
+EFFECTIVE_GEMINI_DIRECT_AUDIO_INPUT = GEMINI_DIRECT_AUDIO_INPUT and (not ORCHESTRATION_SINGLE_PATH)
 CAMERA_FRAME_MIN_INTERVAL_SEC = float(os.getenv("CAMERA_FRAME_MIN_INTERVAL_SEC", "1.0"))
 VISION_SNAPSHOT_TTL_SEC = float(os.getenv("VISION_SNAPSHOT_TTL_SEC", "120"))
 ENV_CACHE_TTL_SEC = float(os.getenv("ENV_CACHE_TTL_SEC", "300"))
@@ -78,12 +80,18 @@ AZURE_OPENAI_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
 INTENT_ROUTER_MODEL = os.getenv("INTENT_ROUTER_MODEL") or AZURE_OPENAI_DEPLOYMENT_NAME or "gpt-4o-mini"
 ENABLE_TRANSIT_FILLER = os.getenv("ENABLE_TRANSIT_FILLER", "false").strip().lower() in {"1", "true", "yes", "on"}
 STT_SEGMENTATION_SILENCE_TIMEOUT_MS = os.getenv("STT_SEGMENTATION_SILENCE_TIMEOUT_MS", "280")
+AI_STT_SEGMENTATION_SILENCE_TIMEOUT_MS = os.getenv("AI_STT_SEGMENTATION_SILENCE_TIMEOUT_MS", "900")
+AI_FLUSH_SILENCE_AFTER_SEC = float(os.getenv("AI_FLUSH_SILENCE_AFTER_SEC", "1.2"))
+AI_FLUSH_SILENCE_SEC = float(os.getenv("AI_FLUSH_SILENCE_SEC", "0.15"))
+AI_FLUSH_MIN_INTERVAL_SEC = float(os.getenv("AI_FLUSH_MIN_INTERVAL_SEC", "1.5"))
 GMAIL_POLL_INTERVAL_SEC = float(os.getenv("GMAIL_POLL_INTERVAL_SEC", "60"))
 GMAIL_ALERT_BIND_USER = os.getenv("GMAIL_ALERT_BIND_USER", "true").strip().lower() in {"1", "true", "yes", "on"}
 GMAIL_IDLE_TIMEOUT_SEC = float(os.getenv("GMAIL_IDLE_TIMEOUT_SEC", "120"))
 GMAIL_LIVE_POLL_FALLBACK_SEC = float(os.getenv("GMAIL_LIVE_POLL_FALLBACK_SEC", "20"))
 print(f"[Config] ENABLE_TRANSIT_FILLER={ENABLE_TRANSIT_FILLER}")
 print(f"[Config] GEMINI_DIRECT_AUDIO_INPUT={GEMINI_DIRECT_AUDIO_INPUT}")
+print(f"[Config] ORCHESTRATION_SINGLE_PATH={ORCHESTRATION_SINGLE_PATH}")
+print(f"[Config] EFFECTIVE_GEMINI_DIRECT_AUDIO_INPUT={EFFECTIVE_GEMINI_DIRECT_AUDIO_INPUT}")
 
 try:
     NEWS_AGENT = NewsAgent()
@@ -914,6 +922,36 @@ def _execute_tools_for_intent(
         user_text=user_text,
     )
 
+
+def _fast_route_intent(text: str, active_timer: bool = False):
+    t = str(text or "").strip()
+    if not t:
+        return None
+    norm = re.sub(r"\s+", "", t.lower())
+
+    # Timer cancel should have highest priority while timer is active.
+    if active_timer and any(k in norm for k in ["지금말해", "바로말해", "바로", "지금", "취소", "그만", "중지"]):
+        return {"intent": "timer_cancel", "destination": None, "source": "fast", "home_update": False, "timer_seconds": None}
+
+    timer_match = re.search(r"(\d{1,3})\s*(초|분|시간)\s*(뒤|후)", t)
+    if timer_match:
+        n = int(timer_match.group(1))
+        unit = timer_match.group(2)
+        sec = n if unit == "초" else n * 60 if unit == "분" else n * 3600
+        if 5 <= sec <= 21600:
+            return {"intent": "timer", "destination": None, "source": "fast", "home_update": False, "timer_seconds": sec}
+
+    if any(k in norm for k in ["미세먼지", "초미세", "대기질", "aqi"]):
+        return {"intent": "air_quality", "destination": None, "source": "fast", "home_update": False, "timer_seconds": None}
+
+    if any(k in norm for k in ["날씨", "기온", "강수", "비와", "비와?", "덥", "춥"]):
+        return {"intent": "weather", "destination": None, "source": "fast", "home_update": False, "timer_seconds": None}
+
+    if any(k in norm for k in ["뉴스", "헤드라인", "기사"]):
+        return {"intent": "news", "destination": None, "source": "fast", "home_update": False, "timer_seconds": None}
+
+    return None
+
 # --- Helper: Azure STT Setup ---
 def create_push_stream(sample_rate=16000):
     stream_format = speechsdk.audio.AudioStreamFormat(samples_per_second=sample_rate, bits_per_sample=16, channels=1)
@@ -921,13 +959,13 @@ def create_push_stream(sample_rate=16000):
     audio_config = speechsdk.audio.AudioConfig(stream=push_stream)
     return push_stream, audio_config
 
-def create_recognizer(audio_config, language="en-US"): # Default to English for now, or use "ko-KR"
+def create_recognizer(audio_config, language="en-US", silence_timeout_ms: str | None = None): # Default to English for now, or use "ko-KR"
     speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION)
     speech_config.speech_recognition_language = language
     # Too-low timeout harms Korean phrase stability. Use tunable default.
     speech_config.set_property(
         speechsdk.PropertyId.Speech_SegmentationSilenceTimeoutMs,
-        str(STT_SEGMENTATION_SILENCE_TIMEOUT_MS),
+        str(silence_timeout_ms or STT_SEGMENTATION_SILENCE_TIMEOUT_MS),
     )
     
     recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
@@ -1028,10 +1066,18 @@ async def audio_websocket(ws: WebSocket):
 
     # Initialize Azure STT (User: 16kHz, AI: 24kHz)
     user_push_stream, user_audio_config = create_push_stream(16000)
-    user_recognizer = create_recognizer(user_audio_config, "ko-KR") # Assuming Korean context based on user prompts
+    user_recognizer = create_recognizer(
+        user_audio_config,
+        "ko-KR",
+        silence_timeout_ms=str(STT_SEGMENTATION_SILENCE_TIMEOUT_MS),
+    ) # Assuming Korean context based on user prompts
 
     ai_push_stream, ai_audio_config = create_push_stream(24000)
-    ai_recognizer = create_recognizer(ai_audio_config, "ko-KR")
+    ai_recognizer = create_recognizer(
+        ai_audio_config,
+        "ko-KR",
+        silence_timeout_ms=str(AI_STT_SEGMENTATION_SILENCE_TIMEOUT_MS),
+    )
 
     # Capture the main event loop
     loop = asyncio.get_running_loop()
@@ -1060,6 +1106,14 @@ async def audio_websocket(ws: WebSocket):
         "suppressed_audio_seen": False,
         "block_direct_audio": False,
         "block_direct_audio_until": 0.0,
+        "post_context_audio_hold_until": 0.0,
+        "active_since": 0.0,
+        "context_sent_at": 0.0,
+        "pending_intent": None,
+        "pending_context_summary": "",
+        "pending_action_instruction": "",
+        "pending_user_text": "",
+        "retry_issued": False,
         "forced_intent_turn": None,
     }
 
@@ -1099,14 +1153,32 @@ async def audio_websocket(ws: WebSocket):
         style: str = "",
         complete_turn: bool = True,
     ):
-        await proactive_service.request_spoken_response_with_context(
-            intent_tag=intent_tag,
-            context_summary=context_summary,
-            action_instruction=action_instruction,
-            tone=tone,
-            style=style,
-            complete_turn=complete_turn,
-        )
+        try:
+            await proactive_service.request_spoken_response_with_context(
+                intent_tag=intent_tag,
+                context_summary=context_summary,
+                action_instruction=action_instruction,
+                tone=tone,
+                style=style,
+                complete_turn=complete_turn,
+            )
+            response_guard["context_sent"] = True
+            response_guard["context_sent_at"] = time.monotonic()
+        except Exception as e:
+            print(f"[Guard] context request failed: {e}")
+            _reset_response_gate("context request failed")
+
+    def _submit_coroutine(coro, label: str):
+        if not loop.is_running():
+            return None
+        fut = asyncio.run_coroutine_threadsafe(coro, loop)
+        def _done_callback(f):
+            try:
+                _ = f.result()
+            except Exception as ex:
+                print(f"[Async:{label}] failed: {ex}")
+        fut.add_done_callback(_done_callback)
+        return fut
 
     async def _send_user_text_turn(user_text: str):
         session_obj = session_ref.get("obj")
@@ -1121,6 +1193,15 @@ async def audio_websocket(ws: WebSocket):
             ],
             turn_complete=True,
         )
+
+    async def _inject_guarded_context_turn(context_text: str):
+        try:
+            await _inject_live_context_now(context_text, complete_turn=True)
+            response_guard["context_sent"] = True
+            response_guard["context_sent_at"] = time.monotonic()
+        except Exception as e:
+            print(f"[Guard] guarded context inject failed: {e}")
+            _reset_response_gate("guarded context inject failed")
 
     async def _send_proactive_announcement(
         summary_text: str,
@@ -1262,7 +1343,9 @@ async def audio_websocket(ws: WebSocket):
                     route_dedupe["text"] = normalized_user_text
                     route_dedupe["ts"] = now_ts
 
-                    route = intent_router.route(text, active_timer=timer_service.has_active())
+                    route = _fast_route_intent(text, active_timer=timer_service.has_active())
+                    if not route:
+                        route = intent_router.route(text, active_timer=timer_service.has_active())
                     intent = route.get("intent") if isinstance(route, dict) else "commute_overview"
                     routed_dest = route.get("destination") if isinstance(route, dict) else None
                     routed_home_update = bool(route.get("home_update")) if isinstance(route, dict) else False
@@ -1278,13 +1361,23 @@ async def audio_websocket(ws: WebSocket):
                         intent = "general"
                     if intent == "timer_cancel" and timer_service.has_active():
                         canceled = timer_service.cancel_all()
-                        asyncio.run_coroutine_threadsafe(
-                            _inject_live_context_now(
+                        # Force a single controlled response turn; suppress direct audio turn.
+                        response_guard["active"] = True
+                        response_guard["context_sent"] = False
+                        response_guard["suppressed_audio_seen"] = False
+                        response_guard["block_direct_audio"] = True
+                        response_guard["active_since"] = time.monotonic()
+                        response_guard["context_sent_at"] = 0.0
+                        response_guard["block_direct_audio_until"] = max(
+                            float(response_guard.get("block_direct_audio_until") or 0.0),
+                            time.monotonic() + 4.0,
+                        )
+                        _submit_coroutine(
+                            _inject_guarded_context_turn(
                                 f"[INTENT:timer_canceled] Canceled {canceled} active timer(s). "
-                                "Acknowledge cancellation briefly in Korean, then answer the user's current request directly.",
-                                complete_turn=True,
+                                "Acknowledge cancellation briefly in Korean, then answer the user's current request directly."
                             ),
-                            loop,
+                            label="timer_cancel",
                         )
                         # Let the same user utterance proceed naturally after cancel notice.
                         # Do not run live-tool routing for this branch.
@@ -1309,18 +1402,31 @@ async def audio_websocket(ws: WebSocket):
                             timer_set_dedupe["key"] = timer_key
                             timer_set_dedupe["ts"] = now_timer_ts
 
-                            # Block stale parallel model response from the raw audio turn.
+                            # Force a single controlled timer-set response.
                             response_guard["active"] = True
-                            response_guard["context_sent"] = True
+                            response_guard["context_sent"] = False
                             response_guard["suppressed_audio_seen"] = False
                             response_guard["block_direct_audio"] = True
+                            response_guard["active_since"] = time.monotonic()
+                            response_guard["context_sent_at"] = 0.0
+                            response_guard["retry_issued"] = False
                             response_guard["block_direct_audio_until"] = max(
                                 float(response_guard.get("block_direct_audio_until") or 0.0),
-                                time.monotonic() + 1.4,
+                                time.monotonic() + 4.0,
                             )
                             transit_turn_gate["until"] = max(
                                 float(transit_turn_gate.get("until") or 0.0),
                                 time.monotonic() + 1.1,
+                            )
+                            _submit_coroutine(
+                                _inject_guarded_context_turn(
+                                    (
+                                        f"[INTENT:timer_set] Timer seconds={timer_sec}. "
+                                        "Confirm timer set in one short Korean sentence. "
+                                        "Do not repeat the same timer confirmation."
+                                    )
+                                ),
+                                label="timer_set",
                             )
                             asyncio.run_coroutine_threadsafe(
                                 timer_service.register(timer_sec),
@@ -1346,6 +1452,10 @@ async def audio_websocket(ws: WebSocket):
                             )
                             if matched_item is None and wants_followup:
                                 matched_item = news_state.get("selected")
+                            # Detail request without explicit match:
+                            # keep conversation in current news context instead of re-fetching generic news.
+                            if matched_item is None and wants_detail:
+                                matched_item = news_state.get("selected") or ((news_state.get("items") or [None])[0])
                             if matched_item is not None:
                                 news_state["selected"] = matched_item
                                 intent = "news_detail" if wants_detail else "news_followup"
@@ -1390,6 +1500,9 @@ async def audio_websocket(ws: WebSocket):
                             transit_turn_gate=transit_turn_gate,
                             intent=intent,
                         )
+                        response_guard["active_since"] = time.monotonic()
+                        response_guard["context_sent_at"] = 0.0
+                        response_guard["retry_issued"] = False
                         if client_state.get("lat") is not None and client_state.get("lng") is not None and loop.is_running():
                             asyncio.run_coroutine_threadsafe(
                                 _inject_live_context_now(
@@ -1403,7 +1516,7 @@ async def audio_websocket(ws: WebSocket):
                         # For transit queries that require live API fetch, speak a short filler first.
                         # This reduces awkward silence while ODSAY/Seoul APIs are being fetched.
                         if (
-                            (not GEMINI_DIRECT_AUDIO_INPUT)
+                            (not EFFECTIVE_GEMINI_DIRECT_AUDIO_INPUT)
                             and ENABLE_TRANSIT_FILLER
                             and intent in {"subway_route", "bus_route", "commute_overview"}
                             and loop.is_running()
@@ -1503,7 +1616,11 @@ async def audio_websocket(ws: WebSocket):
                             ws_orchestrator.extend_post_context_gate(transit_turn_gate)
 
                         if loop.is_running():
-                            asyncio.run_coroutine_threadsafe(
+                            response_guard["pending_intent"] = (intent or "commute_overview")
+                            response_guard["pending_context_summary"] = context_summary
+                            response_guard["pending_action_instruction"] = action_instruction
+                            response_guard["pending_user_text"] = str(text or "").strip()
+                            _submit_coroutine(
                                 _request_spoken_response_with_context(
                                     intent_tag=(intent or "commute_overview"),
                                     context_summary=context_summary,
@@ -1511,12 +1628,11 @@ async def audio_websocket(ws: WebSocket):
                                     tone="neutral",
                                     complete_turn=(intent in context_priority_intents),
                                 ),
-                                loop,
+                                label=f"context_turn:{intent}",
                             )
-                            response_guard["context_sent"] = True
                     else:
                         # Text-only path for non-routing/general turns when direct audio is disabled.
-                        if (not GEMINI_DIRECT_AUDIO_INPUT) and loop.is_running():
+                        if (not EFFECTIVE_GEMINI_DIRECT_AUDIO_INPUT) and loop.is_running():
                             asyncio.run_coroutine_threadsafe(_send_user_text_turn(text), loop)
                 except Exception as e:
                     print(f"[SeoulInfo] dynamic context build failed: {e}")
@@ -1623,7 +1739,8 @@ async def audio_websocket(ws: WebSocket):
 
                         # Safety release: if timed block elapsed, release hard block flag.
                         if (
-                            response_guard.get("block_direct_audio")
+                            (not response_guard.get("active"))
+                            and response_guard.get("block_direct_audio")
                             and time.monotonic() >= float(response_guard.get("block_direct_audio_until") or 0.0)
                         ):
                             response_guard["block_direct_audio"] = False
@@ -1662,9 +1779,11 @@ async def audio_websocket(ws: WebSocket):
                             except Exception as e:
                                 print(f"[SeoulInfo] context injection failed: {e}")
                         if (
-                            GEMINI_DIRECT_AUDIO_INPUT
+                            EFFECTIVE_GEMINI_DIRECT_AUDIO_INPUT
+                            and (not response_guard.get("active"))
                             and (not response_guard.get("block_direct_audio"))
                             and time.monotonic() >= float(response_guard.get("block_direct_audio_until") or 0.0)
+                            and time.monotonic() >= float(response_guard.get("post_context_audio_hold_until") or 0.0)
                             and time.monotonic() >= float(transit_turn_gate.get("until") or 0.0)
                         ):
                             await session.send_realtime_input(audio={"data": data, "mime_type": "audio/pcm;rate=16000"})
@@ -1689,20 +1808,9 @@ async def audio_websocket(ws: WebSocket):
                                             continue
                                         # Suppress premature model audio while live-context turn is being prepared.
                                         if time.monotonic() < float(transit_turn_gate.get("until") or 0.0):
-                                            if response_guard.get("active"):
-                                                response_guard["suppressed_audio_seen"] = True
                                             continue
                                         # Drop any model audio before live context is sent for this guarded turn.
                                         if response_guard.get("active") and (not response_guard.get("context_sent")):
-                                            response_guard["suppressed_audio_seen"] = True
-                                            continue
-                                        # If we already saw suppressed audio before context turn was ready,
-                                        # keep dropping until the stale turn completes.
-                                        if (
-                                            response_guard.get("active")
-                                            and response_guard.get("context_sent")
-                                            and response_guard.get("suppressed_audio_seen")
-                                        ):
                                             continue
                                         await ws.send_bytes(audio_bytes)
                                         # [Fix] Offload AI audio write to thread
@@ -1713,22 +1821,19 @@ async def audio_websocket(ws: WebSocket):
                             
                             # [Fix 3] Monitor Gemini Turn Complete
                             if response.server_content and response.server_content.turn_complete:
-                                if (
-                                    response_guard.get("active")
-                                    and response_guard.get("context_sent")
-                                    and response_guard.get("suppressed_audio_seen")
-                                ):
-                                    # Stale pre-context turn ended; allow the next turn through.
-                                    response_guard["suppressed_audio_seen"] = False
-                                    response_guard["active"] = False
-                                    response_guard["block_direct_audio"] = False
-                                    response_guard["block_direct_audio_until"] = 0.0
-                                    response_guard["forced_intent_turn"] = None
-                                elif response_guard.get("active") and response_guard.get("context_sent"):
+                                if response_guard.get("active") and response_guard.get("context_sent"):
                                     # No stale audio detected; normal guarded turn complete.
                                     response_guard["active"] = False
                                     response_guard["block_direct_audio"] = False
                                     response_guard["block_direct_audio_until"] = 0.0
+                                    response_guard["post_context_audio_hold_until"] = time.monotonic() + 0.9
+                                    response_guard["active_since"] = 0.0
+                                    response_guard["context_sent_at"] = 0.0
+                                    response_guard["pending_intent"] = None
+                                    response_guard["pending_context_summary"] = ""
+                                    response_guard["pending_action_instruction"] = ""
+                                    response_guard["pending_user_text"] = ""
+                                    response_guard["retry_issued"] = False
                                     response_guard["forced_intent_turn"] = None
 
                 except Exception as e:
@@ -1737,17 +1842,50 @@ async def audio_websocket(ws: WebSocket):
 
             # [Smart Flush]
             async def smart_flush_injector():
-                silence_chunk = b'\x00' * 24000 
+                # 24kHz, 16-bit mono => bytes_per_second = 48000
+                silence_chunk = b"\x00" * int(max(1, AI_FLUSH_SILENCE_SEC) * 48000)
+                last_flush_ts = 0.0
                 try:
                     while True:
                         await asyncio.sleep(0.1) # Check every 100ms
                         now = asyncio.get_running_loop().time()
+                        now_mono = time.monotonic()
                         
-                        # If > 500ms passed since last audio AND we haven't flushed yet
-                        if (now - state["last_ai_write_time"] > 0.5) and (not state["flushed"]):
+                        # Flush only when pause is meaningful; avoid over-fragmenting AI STT transcript.
+                        if (
+                            (now - state["last_ai_write_time"] > AI_FLUSH_SILENCE_AFTER_SEC)
+                            and (not state["flushed"])
+                            and (not response_guard.get("active"))
+                            and (now_mono - last_flush_ts > AI_FLUSH_MIN_INTERVAL_SEC)
+                        ):
                             print("[STT] Pause detected. Injecting silence to flush buffer.")
                             await asyncio.to_thread(ai_push_stream.write, silence_chunk)
                             state["flushed"] = True # Mark as flushed to STOP sending silence
+                            last_flush_ts = now_mono
+
+                        # Guard watchdog:
+                        # Do not inject user-text retry here (it can cause "정보 없음" pre-utterance).
+                        # Just release deadlock if guarded turn stays silent too long.
+                        if (
+                            response_guard.get("active")
+                            and response_guard.get("context_sent")
+                            and (now_mono - float(response_guard.get("context_sent_at") or response_guard.get("active_since") or 0.0) > 4.0)
+                        ):
+                            print("[Guard] no output after context turn; releasing guard")
+                            response_guard["active"] = False
+                            response_guard["context_sent"] = False
+                            response_guard["suppressed_audio_seen"] = False
+                            response_guard["block_direct_audio"] = False
+                            response_guard["block_direct_audio_until"] = 0.0
+                            response_guard["post_context_audio_hold_until"] = 0.0
+                            response_guard["active_since"] = 0.0
+                            response_guard["context_sent_at"] = 0.0
+                            response_guard["pending_intent"] = None
+                            response_guard["pending_context_summary"] = ""
+                            response_guard["pending_action_instruction"] = ""
+                            response_guard["pending_user_text"] = ""
+                            response_guard["retry_issued"] = False
+                            response_guard["forced_intent_turn"] = None
                             
                 except asyncio.CancelledError:
                     pass

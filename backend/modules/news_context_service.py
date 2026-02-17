@@ -63,51 +63,49 @@ class NewsContextService:
         t = str(text or "").strip().lower()
         if not t:
             return False
-        return any(
-            k in t
-            for k in [
-                "자세히",
-                "상세",
-                "무슨 내용",
-                "어떤 내용",
-                "핵심",
-                "요약",
-                "더 알려",
-                "더 말해",
-                "그 기사",
-                "그 뉴스",
-                "이 기사",
-                "이 뉴스",
-                "1번",
-                "2번",
-                "3번",
-                "첫 번째",
-                "두 번째",
-                "세 번째",
-            ]
-        )
+        keys = [
+            "자세히",
+            "상세",
+            "무슨 내용",
+            "어떤 내용",
+            "디테일",
+            "요약",
+            "더 알려",
+            "더 말해",
+            "그 기사",
+            "그 뉴스",
+            "첫 기사",
+            "첫 뉴스",
+            "1번",
+            "2번",
+            "3번",
+            "첫번째",
+            "두번째",
+            "세번째",
+            "관련 뉴스",
+        ]
+        return any(k in t for k in keys)
 
     def is_followup_query(self, text: str | None) -> bool:
         t = str(text or "").strip().lower()
         if not t:
             return False
-        return any(
-            k in t
-            for k in [
-                "그럼",
-                "그건",
-                "왜",
-                "언제",
-                "누가",
-                "어디",
-                "어떻게",
-                "무슨 의미",
-                "영향",
-                "결국",
-                "정리",
-                "다시 설명",
-            ]
-        )
+        keys = [
+            "그럼",
+            "그건",
+            "왜",
+            "언제",
+            "누가",
+            "어디",
+            "어떻게",
+            "무슨 의미",
+            "영향",
+            "결과",
+            "정리",
+            "다시 설명",
+            "추가로",
+        ]
+        return any(k in t for k in keys)
 
     def select_item_by_text(self, text: str | None, items: list[dict[str, Any]]):
         t = str(text or "").strip().lower()
@@ -115,17 +113,28 @@ class NewsContextService:
             return None
 
         explicit_idx = None
-        if "1번" in t or "첫 번째" in t:
+        if "1번" in t or "첫번째" in t:
             explicit_idx = 0
-        elif "2번" in t or "두 번째" in t:
+        elif "2번" in t or "두번째" in t:
             explicit_idx = 1
-        elif "3번" in t or "세 번째" in t:
+        elif "3번" in t or "세번째" in t:
             explicit_idx = 2
         if explicit_idx is not None and 0 <= explicit_idx < len(items):
             return items[explicit_idx]
 
         tokens = [tok for tok in re.split(r"[\s,./!?]+", t) if len(tok) >= 2]
-        stop_tokens = {"뉴스", "기사", "자세히", "상세", "요약", "내용", "그거", "그럼", "더", "알려줘"}
+        stop_tokens = {
+            "뉴스",
+            "기사",
+            "자세히",
+            "상세",
+            "요약",
+            "내용",
+            "그거",
+            "그럼",
+            "왜",
+            "알려줘",
+        }
         tokens = [tok for tok in tokens if tok not in stop_tokens]
 
         best = None
@@ -148,14 +157,14 @@ class NewsContextService:
 
     def build_detail_summary(self, item: dict[str, Any] | None) -> str:
         if not isinstance(item, dict):
-            return "해당 뉴스의 핵심 내용을 찾지 못했어요."
+            return "해당 뉴스의 상세 내용을 찾지 못했어요."
         title = str(item.get("title") or "").strip()
         desc = re.sub(r"\s+", " ", str(item.get("description") or "").strip())
         if len(desc) > 220:
             desc = desc[:220].rstrip() + "..."
         if title and desc:
-            return f"기사 제목은 '{title}'이고, 핵심은 다음과 같아요: {desc}"
+            return f"기사 제목은 '{title}'이고, 핵심 내용은 다음과 같아요. {desc}"
         if title:
-            return f"기사 제목은 '{title}'입니다. 제목 기준 핵심만 간단히 설명해드릴게요."
-        return "기사 핵심 요약을 만들 수 없어요."
+            return f"기사 제목은 '{title}'입니다. 제목 기준으로 핵심만 간단히 설명드릴게요."
+        return "기사 상세 요약을 만들 수 없어요."
 

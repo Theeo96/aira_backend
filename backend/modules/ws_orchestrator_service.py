@@ -32,7 +32,8 @@ class WsOrchestratorService:
         response_guard["context_sent"] = False
         response_guard["suppressed_audio_seen"] = False
         response_guard["block_direct_audio"] = True
-        response_guard["block_direct_audio_until"] = time.monotonic() + (5.0 if env_intent else 4.0)
+        # Keep this short to reduce latency while still blocking stale pre-context audio.
+        response_guard["block_direct_audio_until"] = time.monotonic() + (2.2 if env_intent else 2.0)
         response_guard["forced_intent_turn"] = intent
         if not env_intent:
             transit_turn_gate["until"] = max(
@@ -50,18 +51,20 @@ class WsOrchestratorService:
 
     def build_action_instruction(self, intent: str):
         action_instruction = (
-            "사용자의 최신 질문에 지금 바로 한국어로 답하세요. "
-            "최종 답변은 한 번만, 간결하게 말하세요. "
-            "요약/반복/재확인 질문을 추가하지 마세요. "
-            "제공된 요약에 데이터가 있으면 바로 그 값을 말하고, "
-            "요약이 명시적으로 데이터 없음일 때만 없다고 말하세요."
+            "Answer the user's latest question directly in Korean. "
+            "Use provided live context first. "
+            "Give exactly one final answer turn. "
+            "Do not repeat the same content. "
+            "Do not add fallback lines like 'cannot check now' if context already contains usable values. "
+            "Only say data is unavailable when context explicitly indicates missing data."
         )
         if intent in {"weather", "air_quality"}:
-            action_instruction += " 목적지 관련 질문은 하지 마세요."
+            action_instruction += " Do not ask destination-related follow-up questions."
         if intent in {"news_detail", "news_followup"}:
             action_instruction += (
-                " 기사 전문을 낭독하지 말고, 핵심만 2~3문장으로 요약하세요. "
-                "추가 질문에는 같은 기사 맥락에서 이어서 답하세요."
+                " Do not read article text verbatim. "
+                "Summarize 핵심만 2~3문장으로 전달하고, "
+                "follow-up 질문은 같은 기사 맥락으로 이어서 답변하세요."
             )
         return action_instruction
 
@@ -74,4 +77,3 @@ class WsOrchestratorService:
                 + " ".join(guidance)
             ).strip()
         return context_summary
-

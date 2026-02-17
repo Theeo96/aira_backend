@@ -17,6 +17,9 @@ class ProactiveService:
         self.response_guard["suppressed_audio_seen"] = False
         self.response_guard["block_direct_audio"] = False
         self.response_guard["block_direct_audio_until"] = 0.0
+        self.response_guard["post_context_audio_hold_until"] = 0.0
+        self.response_guard["active_since"] = 0.0
+        self.response_guard["context_sent_at"] = 0.0
         self.response_guard["forced_intent_turn"] = None
         self.transit_turn_gate["until"] = 0.0
         if reason:
@@ -33,20 +36,20 @@ class ProactiveService:
     ):
         tone_key = str(tone or "neutral").strip().lower()
         tone_guide = {
-            "urgent": "톤은 차분하지만 단호하게.",
-            "celebratory": "톤은 밝고 축하하는 느낌으로.",
-            "empathetic": "톤은 공감적이고 부드럽게.",
-            "neutral": "톤은 자연스럽고 담백하게.",
-        }.get(tone_key, "톤은 자연스럽고 담백하게.")
+            "urgent": "Tone: concise and urgent but calm.",
+            "celebratory": "Tone: bright and congratulatory.",
+            "empathetic": "Tone: warm and empathetic.",
+            "neutral": "Tone: natural and concise.",
+        }.get(tone_key, "Tone: natural and concise.")
         style_hint = str(style or "").strip()
         ctx = (
             f"[INTENT:{str(intent_tag or 'general')}]\n"
             f"[CONTEXT] {str(context_summary or '').strip()}\n"
             f"[STYLE] {tone_guide} "
-            + (f"추가 스타일 힌트: {style_hint}. " if style_hint else "")
+            + (f"Additional style hint: {style_hint}. " if style_hint else "")
             + "\n"
             f"[ACTION] {str(action_instruction or '').strip()} "
-            "한 번만 말하고 중복 반복하지 마세요."
+            "Speak once only and do not repeat."
         )
         await self.inject_live_context_now(ctx, complete_turn=complete_turn)
 
@@ -60,17 +63,16 @@ class ProactiveService:
         msg = str(summary_text or "").strip()
         if not msg:
             return
-        self.reset_response_gate("before proactive email alert")
+        self.reset_response_gate("before proactive alert")
         await self.request_spoken_response_with_context(
             intent_tag="proactive_alert",
             context_summary=msg,
             tone=tone,
             style=style,
             action_instruction=(
-                "사용자에게 한국어로 자연스럽게 먼저 안내하세요. "
-                + ("끝에 짧은 후속 안내 한 마디를 덧붙이세요." if add_followup_hint else "추가 멘트 없이 핵심만 말하세요.")
+                "사용자에게 자연스럽게 먼저 알림을 전달하세요. "
+                + ("마지막에 짧은 후속 안내 한 문장만 덧붙이세요." if add_followup_hint else "추가 멘트 없이 알림만 전달하세요.")
             ),
             complete_turn=True,
         )
-        self.reset_response_gate("after proactive email alert")
-
+        self.reset_response_gate("after proactive alert")

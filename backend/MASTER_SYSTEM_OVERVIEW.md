@@ -210,3 +210,89 @@
 ---
 
 이 문서는 기존 `FEATURE_OVERVIEW.md`, `RUNTIME_API_TIMING.md`, `SERVER_CHANGES.md`(이력), `SERVER_REF_DIFF_SUMMARY.md`의 내용을 실행 관점으로 통합 정리한 최신 개요 문서입니다.
+
+## Recent Server Patch (for merge-to-main stability)
+
+- Date: 2026-02-17
+- Files: `backend/server.py`, `backend/modules/ws_orchestrator_service.py`, `backend/modules/proactive_service.py`
+
+### Why
+- Prevent pre-utterance like "���� ����" before real API-based answer.
+- Prevent duplicated same response for one user turn.
+- Reduce race between direct-audio path and context-forced response path.
+
+### What changed
+- `backend/server.py`
+  - During guarded turns, direct Gemini audio input is now strictly blocked:
+    - direct audio send condition now requires `response_guard.active == False`.
+    - timed block release no longer happens while `response_guard.active == True`.
+  - Timer set/cancel intents now force a single controlled context turn and block direct-audio race during that turn.
+- `backend/modules/ws_orchestrator_service.py`
+  - Rewrote action-instruction text in clean form (no mojibake).
+  - Added stricter one-turn/no-duplicate/no-false-fallback guidance.
+- `backend/modules/proactive_service.py`
+  - Rewrote proactive/tone instruction text in clean form (no mojibake).
+  - Kept single-turn delivery rule explicit.
+
+### Expected effect
+- Less "unknown/unavailable" premature speech when data is actually available.
+- Less duplicate response output in timer and routed API turns.
+- Better determinism with main-merge-friendly local changes only.
+
+## Hotfix 2026-02-17 (No weather response / guard deadlock)
+
+- Issue: user asks weather, `live context built` appears, but no spoken response.
+- Cause: guard state could be marked `context_sent=True` before actual context send succeeded, leading to output suppression deadlock.
+- Fixes:
+  - `backend/server.py`
+    - Added `_submit_coroutine(...)` with async error logging.
+    - Added guarded helpers to mark `context_sent` only after successful context send.
+    - Replaced key context-turn scheduling paths (`weather/air/news/transit`, `timer_set`, `timer_cancel`) to use guarded submission.
+    - On context-send failure, reset guard immediately.
+- Validation: `python -m py_compile backend/server.py` passed.
+
+## Hotfix 2026-02-17-2 (Silent response after weather intent)
+
+- Symptom: `intent=weather` and `live context built` log appeared, but no AI speech output.
+- Root cause: response guard could remain active without output, causing subsequent turns to be blocked.
+- Fixes (`backend/server.py`):
+  - Added pending context metadata in guard (`pending_intent`, `pending_context_summary`, `pending_action_instruction`, `retry_issued`).
+  - Added watchdog in `smart_flush_injector`:
+    - If guarded turn has no output for 3s, retry one forced context turn.
+    - If still no output, release guard to avoid full conversation lock.
+  - Cleared pending guard metadata on normal `turn_complete` release path.
+- Validation: `python -m py_compile backend/server.py` passed.
+
+## Hotfix 2026-02-17-3 (1008 disconnect on retry)
+
+- Symptom: after weather intent, guard retry ran and session closed with 1008.
+- Change:
+  - Guard watchdog retry path switched from "context-turn retry" to "plain user-text turn retry".
+  - Added pending user text state in guard.
+  - Cleared pending guard fields on all guard release paths.
+- Goal: avoid unsupported-operation close while preserving one retry path for silent turns.
+- Validation: `python -m py_compile backend/server.py` passed.
+
+## Hotfix 2026-02-17-4 (Guard state simplification)
+
+- Removed `suppressed_audio_seen`-dependent drop branch from send path.
+- New behavior: while guard is active, block only until context is sent; once context is sent, pass audio normally.
+- Turn-complete release path simplified to one branch (`active && context_sent`).
+- Purpose: prevent guard deadlocks causing silent responses.
+
+## Hotfix 2026-02-17-5 (single-path orchestration)
+
+- Added `ORCHESTRATION_SINGLE_PATH` (default: true).
+- Effective direct-audio path is now controlled by `EFFECTIVE_GEMINI_DIRECT_AUDIO_INPUT`.
+- With default settings, direct user-audio -> Gemini path is disabled, and only STT/orchestration context path is used.
+- Goal: remove parallel response race that caused intermittent pre-utterance and duplicate answers.
+
+## Hotfix 2026-02-17-6 (AI voice mid-cut / STT segmentation)
+
+- Added separate AI STT silence timeout: `AI_STT_SEGMENTATION_SILENCE_TIMEOUT_MS` (default 900ms).
+- Smart flush became less aggressive:
+  - `AI_FLUSH_SILENCE_AFTER_SEC` default 1.2s
+  - `AI_FLUSH_SILENCE_SEC` default 0.15s
+  - `AI_FLUSH_MIN_INTERVAL_SEC` default 1.5s
+- Flush now skips while response guard is active to avoid fragmenting guarded turns.
+- Goal: reduce mid-sentence split in AI STT and perceived voice cut.
