@@ -15,6 +15,7 @@ import azure.cognitiveservices.speech as speechsdk
 import sys
 from modules.cosmos_db import cosmos_service
 from modules.memory import memory_service
+from modules.lumirami import LumiRamiManager  # [NEW] Import Dual Persona Manager
 
 from contextlib import asynccontextmanager
 
@@ -56,8 +57,10 @@ def create_recognizer(audio_config, language="en-US"): # Default to English for 
     speech_config.speech_recognition_language = language
     
     # [Optimization] Reduce segmentation silence timeout to force faster phrase finalization
-    # Default is usually higher (e.g. 500ms-1000ms). Setting to 100ms.
-    speech_config.set_property(speechsdk.PropertyId.Speech_SegmentationSilenceTimeoutMs, "100")
+    # Default is usually higher (e.g. 500ms-1000ms).
+    # 100ms was too short (causing fragments), 2000ms too long (latency).
+    # Setting to 500ms for balance.
+    speech_config.set_property(speechsdk.PropertyId.Speech_SegmentationSilenceTimeoutMs, "500")
     
     recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
     return recognizer
@@ -82,58 +85,89 @@ async def audio_websocket(ws: WebSocket):
         return
 
     # 2. Load Memory (Context)
-    # Fetch ALL past summaries for this user
     # Fetch ALL past summaries for this user (Blocking I/O -> Async Thread)
-    # past_memories = cosmos_service.get_all_memories(user_id) 
     past_memories = await asyncio.to_thread(cosmos_service.get_all_memories, user_id)
     memory_context = ""
     if past_memories:
         memory_context = "Here is the summary of past conversations with this user:\n"
         for item in past_memories:
             summary = item.get("summary", {})
-            context_text = summary.get("context_summary", "No summary")
+            # Handle Dual Summary Structure
+            if "lumi_summary" in summary:
+                context_text = f"[Lumi's View]: {summary.get('lumi_summary', 'No summary')} / [Rami's View]: {summary.get('rami_summary', 'No summary')}"
+            elif "summary_lumi" in summary: # Backward compatibility
+                lumi = summary['summary_lumi'].get('context_summary', '')
+                rami = summary['summary_rami'].get('context_summary', '')
+                context_text = f"[Lumi's View]: {lumi} / [Rami's View]: {rami}"
+            else:
+                context_text = summary.get("context_summary", "No summary")
+
             date = item.get("date", "Unknown Date")
             memory_context += f"- [{date}] {context_text}\n"
         
         print(f"[Memory] Loaded {len(past_memories)} past conversation summaries.")
 
-    # Initialize Gemini
-    client = genai.Client(api_key=API_KEY)
-    
-    # Inject Memory into System Instruction
-    system_instruction = "You are Aira, a helpful AI assistant."
-    if memory_context:
-        system_instruction += f"\n\n[MEMORY LOADED]\n{memory_context}\nUse this context to personalize your responses."
-
-    config = {
-        "response_modalities": ["AUDIO"],
-        "speech_config": {
-            "voice_config": {"prebuilt_voice_config": {"voice_name": "Aoede"}}
-        },
-        "system_instruction": system_instruction
-    }
-
     # Initialize Azure STT (User: 16kHz, AI: 24kHz)
     user_push_stream, user_audio_config = create_push_stream(16000)
     user_recognizer = create_recognizer(user_audio_config, "ko-KR") # Assuming Korean context based on user prompts
 
-    ai_push_stream, ai_audio_config = create_push_stream(24000)
-    ai_recognizer = create_recognizer(ai_audio_config, "ko-KR")
+    # [Refactor] Split AI STT for accurate attribution
+    lumi_push_stream, lumi_audio_config = create_push_stream(24000)
+    lumi_recognizer = create_recognizer(lumi_audio_config, "ko-KR")
+
+    rami_push_stream, rami_audio_config = create_push_stream(24000)
+    rami_recognizer = create_recognizer(rami_audio_config, "ko-KR")
 
     # Capture the main event loop
     loop = asyncio.get_running_loop()
 
-    # Track state for Smart Flushing
-    state = {"last_ai_write_time": 0, "flushed": False}
-    
     # Track Full Transcript for Summarization
     session_transcript = []
 
+    # Callback to send audio back to client
+    async def send_audio_to_client(audio_bytes: bytes, speaker_name: str):
+        try:
+            # Send to Frontend
+            await ws.send_bytes(audio_bytes)
+            
+            # Route to appropriate STT Stream
+            if speaker_name == "lumi":
+                await asyncio.to_thread(lumi_push_stream.write, audio_bytes)
+                
+            elif speaker_name == "rami":
+                await asyncio.to_thread(rami_push_stream.write, audio_bytes)
+            else:
+                # Fallback? Should not happen if speaker_name is strictly lumi/rami
+                pass
+            
+        except Exception as e:
+            print(f"[Server] Error sending audio to client: {e}")
+
+    # [NEW] Flush Helper to force STT finalization
+    async def flush_ai_stt(speaker_name: str):
+        """Inject silence to force STT segmentation/finalization"""
+        try:
+            silence = bytes(24000 * 2 * 1) # 1.0 second of silence (24kHz * 2bytes * 1sec)
+            if speaker_name == "lumi":
+                await asyncio.to_thread(lumi_push_stream.write, silence)
+            elif speaker_name == "rami":
+                await asyncio.to_thread(rami_push_stream.write, silence)
+            print(f"[Server] Flushed STT stream for {speaker_name}")
+        except Exception as e:
+            print(f"[Server] Error flushing STT: {e}")
+
+    # Original Dual Persona Code (Restored)
+    lumi_rami_manager = LumiRamiManager(ws_send_func=send_audio_to_client, flush_stt_func=flush_ai_stt)
+    
     # STT Event Handlers
     def on_recognized(args, role):
         if args.result.text:
             text = args.result.text
-            print(f"[STT] {role}: {text}")
+            
+            # role is now EXPLICIT ("user", "lumi", "rami")
+            # No need for fuzzy "current_speaking_role" state
+            
+            print(f"[Server] STT Recorded ({role}): {text}") # [DEBUG]
             
             # Store for memory
             session_transcript.append(f"{role.upper()}: {text}")
@@ -143,115 +177,88 @@ async def audio_websocket(ws: WebSocket):
             # [Fix 1] Robust Loop Handling
             if loop.is_running():
                 asyncio.run_coroutine_threadsafe(ws.send_text(payload), loop)
+                
+                # Feed STT result to LumiRamiManager
+                asyncio.run_coroutine_threadsafe(lumi_rami_manager.handle_stt_result(text, role), loop)
+
             else:
                 print(f"[Error] Main loop is closed. Cannot send STT: {text}")
 
     user_recognizer.recognized.connect(lambda evt: on_recognized(evt, "user"))
-    ai_recognizer.recognized.connect(lambda evt: on_recognized(evt, "ai"))
+    lumi_recognizer.recognized.connect(lambda evt: on_recognized(evt, "lumi"))
+    rami_recognizer.recognized.connect(lambda evt: on_recognized(evt, "rami"))
 
     user_recognizer.start_continuous_recognition()
-    ai_recognizer.start_continuous_recognition()
+    lumi_recognizer.start_continuous_recognition()
+    rami_recognizer.start_continuous_recognition()
 
     try:
-        async with client.aio.live.connect(model=MODEL_NAME, config=config) as session:
-            print("[Gemini] Connected to Live API")
-            state["last_ai_write_time"] = asyncio.get_running_loop().time()
-            
-            async def receive_from_client():
-                try:
-                    while True:
-                        # [Fix 2] Handle Client Disconnect gracefully
-                        data = await ws.receive_bytes()
-                        if not data: continue
-                        await session.send_realtime_input(audio={"data": data, "mime_type": "audio/pcm;rate=16000"})
-                        # [Fix] Pushing to Azure Stream might block if internal buffer is full. Offload to thread.
-                        await asyncio.to_thread(user_push_stream.write, data)
-                except WebSocketDisconnect:
-                    print("[Server] WebSocket Disconnected (Receive Loop)")
-                    return # Clean exit logic will be handled by finally block
-                except Exception as e:
-                    print(f"[Server] Error processing input: {e}")
+        # Start Lumi/Rami Manager
+        await lumi_rami_manager.start()
 
-            async def send_to_client():
-                try:
-                    while True:
-                        async for response in session.receive():
-                            if response.server_content and response.server_content.model_turn:
-                                for part in response.server_content.model_turn.parts:
-                                    if part.inline_data:
-                                        audio_bytes = part.inline_data.data
-                                        await ws.send_bytes(audio_bytes)
-                                        # [Fix] Offload AI audio write to thread
-                                        await asyncio.to_thread(ai_push_stream.write, audio_bytes)
-                                        # Update state: Audio received, not flushed yet
-                                        state["last_ai_write_time"] = asyncio.get_running_loop().time()
-                                        state["flushed"] = False
-                            
-                            # [Fix 3] Monitor Gemini Turn Complete
-                            if response.server_content and response.server_content.turn_complete:
-                                pass
+        # Ingest Memory Context if available
+        # We can push this as a system message to both
+        if memory_context:
+            # await lumi_rami_manager.queues["lumi"].put(("text", f"[System] Memory Context:\n{memory_context}"))
+            # await lumi_rami_manager.queues["rami"].put(("text", f"[System] Memory Context:\n{memory_context}"))
+            pass
+        
+        async def receive_from_client():
+            try:
+                while True:
+                    # [Fix 2] Handle Client Disconnect gracefully
+                    data = await ws.receive_bytes()
+                    if not data: continue
+                    
+                    # Push to Manager (which pushes to both Geminis)
+                    await lumi_rami_manager.push_audio(data)
+                    
+                    # Push to Azure STT (User stream)
+                    await asyncio.to_thread(user_push_stream.write, data)
+                    
+            except WebSocketDisconnect:
+                print("[Server] WebSocket Disconnected (Receive Loop)")
+                return # Clean exit logic will be handled by finally block
+            except Exception as e:
+                print(f"[Server] Error processing input: {e}")
+                traceback.print_exc() # [DEBUG]
 
-                except Exception as e:
-                    print(f"[Server] Error processing output: {e}")
-                    # Don't raise here, allow silence injector to keep running or clean exit
-
-            # [Smart Flush]
-            async def smart_flush_injector():
-                silence_chunk = b'\x00' * 24000 
-                try:
-                    while True:
-                        await asyncio.sleep(0.1) # Check every 100ms
-                        now = asyncio.get_running_loop().time()
-                        
-                        # If > 500ms passed since last audio AND we haven't flushed yet
-                        if (now - state["last_ai_write_time"] > 0.5) and (not state["flushed"]):
-                            print("[STT] Pause detected. Injecting silence to flush buffer.")
-                            await asyncio.to_thread(ai_push_stream.write, silence_chunk)
-                            state["flushed"] = True # Mark as flushed to STOP sending silence
-                            
-                except asyncio.CancelledError:
-                    pass
-                except Exception as e:
-                    print(f"[Server] Smart Flush Error: {e}")
-
-            # Run tasks
-            done, pending = await asyncio.wait(
-                [
-                    asyncio.create_task(receive_from_client()), 
-                    asyncio.create_task(send_to_client()),
-                    asyncio.create_task(smart_flush_injector())
-                ],
-                return_when=asyncio.FIRST_COMPLETED
-            )
-            for task in pending: task.cancel()
+        # Run tasks
+        # We only need receive loop here, as send loop is handled by Manager's callbacks + internal tasks
+        await receive_from_client()
 
     except Exception as e:
         print(f"[Server] Session Error or Disconnect: {e}")
+        traceback.print_exc() # [DEBUG]
     finally:
         # Cleanup
         print("[Server] Cleaning up resources...")
+        await lumi_rami_manager.stop()
+        
         try:
             # Execute cleanup asynchronously with TIMEOUT to avoid blocking the Event Loop
-            # If Azure takes too long to stop, we just abandon it to prevent "Waiting for child process" hang.
             await asyncio.wait_for(asyncio.to_thread(user_recognizer.stop_continuous_recognition), timeout=2.0)
-            await asyncio.wait_for(asyncio.to_thread(ai_recognizer.stop_continuous_recognition), timeout=2.0)
+            await asyncio.wait_for(asyncio.to_thread(lumi_recognizer.stop_continuous_recognition), timeout=2.0)
+            await asyncio.wait_for(asyncio.to_thread(rami_recognizer.stop_continuous_recognition), timeout=2.0)
         except Exception as e:
             print(f"[Server] Cleanup Warning: {e}")
         try: await ws.close() 
         except: pass
         print("[Server] Connection closed")
 
-        # 3. Save Memory (Summarization)
-        if session_transcript and len(session_transcript) > 2: # Don't save empty sessions
-            print("[Memory] Summarizing session...")
+        # 3. Save Memory (Summarization) - DUAL
+        print(f"[Memory] Transcript Length: {len(session_transcript)}") # [DEBUG]
+        if session_transcript and len(session_transcript) > 0: # [Modified] Lower threshold
+            print("[Memory] Summarizing session (Dual Persona)...")
             full_text = "\n".join(session_transcript)
             
-            # Blocking I/O -> Async Thread
-            summary_json = await asyncio.to_thread(memory_service.summarize, full_text)
+            # Use `summarize_dual`
+            summary_json = await asyncio.to_thread(memory_service.summarize_dual, full_text)
             
-            if summary_json and summary_json.get("context_summary"):
+            if summary_json:
+                # Save with new structure
                 await asyncio.to_thread(cosmos_service.save_memory, user_id, full_text, summary_json)
-                print(f"[Memory] Session saved for {user_id}")
+                print(f"[Memory] Dual Session saved for {user_id}")
             else:
                 print("[Memory] Skipped saving: Summary is empty or invalid.")
 
@@ -259,7 +266,6 @@ async def audio_websocket(ws: WebSocket):
 FRONTEND_BUILD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "temp_front", "out")
 
 if os.path.exists(FRONTEND_BUILD_DIR):
-    # [Fix] Explicitly set MIME types for Windows Server compatibility
     import mimetypes
     mimetypes.add_type("application/javascript", ".js")
     mimetypes.add_type("text/css", ".css")

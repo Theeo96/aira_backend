@@ -4,7 +4,7 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { Mic, MicOff } from "lucide-react";
 
 type TranscriptMessage = {
-  role: "user" | "ai";
+  role: "user" | "ai" | "lumi" | "rami";
   text: string;
 };
 
@@ -216,7 +216,7 @@ export default function Home() {
       <div className="z-10 w-full max-w-4xl items-center justify-between font-mono text-sm flex flex-col gap-4">
         <div className="w-full flex justify-between items-center">
           <h1 className="text-2xl font-bold bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent">
-            Aira Real-time
+            Aira v2.1 (Active/Passive)
           </h1>
           <button onClick={handleLogout} className="text-xs text-gray-500 hover:text-white underline">
             Logout ({userToken})
@@ -258,11 +258,15 @@ export default function Home() {
         {transcripts.length === 0 && <p className="text-gray-600 text-center text-sm py-10">대화 내용이 여기에 표시됩니다...</p>}
         {transcripts.map((msg, idx) => (
           <div key={idx} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
-            <div className={`max-w-[80%] rounded-2xl px-4 py-2 text-sm ${msg.role === "user"
-              ? "bg-blue-600 text-white rounded-br-none"
-              : "bg-gray-700 text-gray-200 rounded-bl-none"
+            <div className={`max-w-[80%] rounded-2xl px-4 py-2 text-sm border ${msg.role === "user"
+              ? "bg-blue-600 text-white border-blue-600 rounded-br-none"
+              : msg.role === "lumi"
+                ? "bg-blue-100 text-blue-900 border-blue-200 rounded-bl-none shadow-sm" // Pastel Blue for Lumi
+                : msg.role === "rami"
+                  ? "bg-orange-100 text-orange-900 border-orange-200 rounded-bl-none shadow-sm" // Pastel Orange for Rami
+                  : "bg-gray-700 text-gray-200 border-gray-600 rounded-bl-none" // Fallback
               }`}>
-              <p className="font-bold text-[10px] opacity-50 mb-1 uppercase">{msg.role}</p>
+              <p className="font-bold text-[10px] opacity-70 mb-1 uppercase">{msg.role}</p>
               {msg.text}
             </div>
           </div>
