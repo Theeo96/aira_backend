@@ -16,6 +16,11 @@ MODEL_NAME = "gemini-2.5-flash-native-audio-preview-12-2025"
 COMMON_INSTRUCTION = """
 [CRITICAL INSTRUCTION: FACTUALITY & PROACTIVITY]
 
+0. **LANGUAGE**: 
+    - **ALWAYS speak in KOREAN.** (한국어로만 말할 것)
+    - Do NOT use English unless explicitly asked to translate.
+
+
 1. **TRUTH ONLY (NO HALLUCINATIONS)**:
     - You have access to [User's Context Info] (Schedule, Emails).
     - If user asks about Schedule/Emails, **YOU MUST ANSWER BASED ONLY ON THAT TEXT.**
@@ -165,9 +170,13 @@ class LumiRamiManager:
             "lumi": {"voice": "Puck", "instruction": RUMI_INSTRUCTION}, 
             "rami": {"voice": "Aoede", "instruction": RAMI_INSTRUCTION}  
         }
+        self.memory_context = {"lumi": "", "rami": ""}
 
-    async def start(self):
+    async def start(self, lumi_memory: str = "", rami_memory: str = ""):
         self.running = True
+        self.memory_context["lumi"] = lumi_memory
+        self.memory_context["rami"] = rami_memory
+        
         print("[LumiRami] Starting Merged Dual Sessions (Legacy Logic + Stable Loop)...")
         if not API_KEY:
              print("[Error] No GEMINI_API_KEY")
@@ -211,7 +220,8 @@ class LumiRamiManager:
         if role == "ai":
              speaker = self.last_ai_speaker if self.last_ai_speaker else "AI"
              
-        print(f"[STT] {speaker.upper()}: {text}")
+        # [Log Cleanup] Server already logs this as "STT Recorded".
+        # print(f"[STT] {speaker.upper()}: {text}")
 
         # [Legacy Logic]
         if role == "user":
@@ -249,13 +259,19 @@ class LumiRamiManager:
         client = genai.Client(api_key=API_KEY)
         my_queue = self.queues[name]
         
+        # [Memory Injection]
+        full_instruction = config_data["instruction"]
+        if self.memory_context.get(name):
+            full_instruction += f"\n\n[REMEMBERED MEMORY from Past Conversations]:\n{self.memory_context[name]}"
+            print(f"[{name}] Injected Long-Term Memory ({len(self.memory_context[name])} chars).")
+
         # [Config Fix] Use Strict Dict Structure from Stable version
         config = {
             "response_modalities": ["AUDIO"],
             "speech_config": {
                 "voice_config": {"prebuilt_voice_config": {"voice_name": config_data["voice"]}}
             },
-            "system_instruction": {"parts": [{"text": config_data["instruction"]}]}, 
+            "system_instruction": {"parts": [{"text": full_instruction}]}, 
             "tools": tools_def 
         }
 

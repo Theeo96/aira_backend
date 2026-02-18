@@ -52,14 +52,14 @@ def create_push_stream(sample_rate=16000):
     audio_config = speechsdk.audio.AudioConfig(stream=push_stream)
     return push_stream, audio_config
 
-def create_recognizer(audio_config, language="en-US"): # Default to English for now, or use "ko-KR"
+def create_recognizer(audio_config, language="ko-KR"): # Default to Korean
     speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION)
     speech_config.speech_recognition_language = language
     
-    # [Optimization] Reduce segmentation silence timeout to force faster phrase finalization
-    # Default is usually higher (e.g. 500ms-1000ms).
-    # 100ms was too short (causing fragments), 2000ms too long (latency).
-    # Setting to 500ms for balance.
+    # [Optimization] Speech Segmentation Logic
+    # 500ms is the "sweet spot" (fast response).
+    # 1.2s was too slow (causing lag).
+    # Reverting to 500ms as requested.
     speech_config.set_property(speechsdk.PropertyId.Speech_SegmentationSilenceTimeoutMs, "500")
     
     recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
@@ -84,70 +84,73 @@ async def audio_websocket(ws: WebSocket):
         await ws.close(code=1008, reason="API Keys missing")
         return
 
-    # 2. Load Memory (Context)
-    # Fetch ALL past summaries for this user (Blocking I/O -> Async Thread)
+    # 2. Load Memory (Context) - [Dual Retrieval]
     past_memories = await asyncio.to_thread(cosmos_service.get_all_memories, user_id)
-    memory_context = ""
+    
+    lumi_mem_str = ""
+    rami_mem_str = ""
+    
     if past_memories:
-        memory_context = "Here is the summary of past conversations with this user:\n"
-        for item in past_memories:
-            summary = item.get("summary", {})
-            # Handle Dual Summary Structure
-            if "lumi_summary" in summary:
-                context_text = f"[Lumi's View]: {summary.get('lumi_summary', 'No summary')} / [Rami's View]: {summary.get('rami_summary', 'No summary')}"
-            elif "summary_lumi" in summary: # Backward compatibility
-                lumi = summary['summary_lumi'].get('context_summary', '')
-                rami = summary['summary_rami'].get('context_summary', '')
-                context_text = f"[Lumi's View]: {lumi} / [Rami's View]: {rami}"
-            else:
-                context_text = summary.get("context_summary", "No summary")
-
-            date = item.get("date", "Unknown Date")
-            memory_context += f"- [{date}] {context_text}\n"
-        
         print(f"[Memory] Loaded {len(past_memories)} past conversation summaries.")
+        
+        # Build specific contexts
+        lumi_items = []
+        rami_items = []
+        
+        for item in past_memories:
+            date = item.get("date", "Unknown Date")
+            summary = item.get("summary", {})
+            
+            # [Lumi Context]
+            if "lumi_summary" in summary:
+                lumi_items.append(f"- [{date}] {summary['lumi_summary']}")
+            elif "summary_lumi" in summary: # Legacy structure
+                lumi_items.append(f"- [{date}] {summary['summary_lumi'].get('context_summary', '')}")
+            else:
+                # Fallback to shared context
+                content = summary.get("context_summary", "")
+                if content: lumi_items.append(f"- [{date}] {content}")
+
+            # [Rami Context]
+            if "rami_summary" in summary:
+                rami_items.append(f"- [{date}] {summary['rami_summary']}")
+            elif "summary_rami" in summary: # Legacy structure
+                rami_items.append(f"- [{date}] {summary['summary_rami'].get('context_summary', '')}")
+            else:
+                # Fallback to shared context
+                content = summary.get("context_summary", "")
+                if content: rami_items.append(f"- [{date}] {content}")
+        
+        if lumi_items:
+            lumi_mem_str = "You recall these past events:\n" + "\n".join(lumi_items)
+        if rami_items:
+            rami_mem_str = "You recall these past events:\n" + "\n".join(rami_items)
 
     # Initialize Azure STT (User: 16kHz, AI: 24kHz)
     user_push_stream, user_audio_config = create_push_stream(16000)
-    user_recognizer = create_recognizer(user_audio_config, "ko-KR") # Assuming Korean context based on user prompts
+    user_recognizer = create_recognizer(user_audio_config, "ko-KR") 
 
-    # [Refactor] Split AI STT for accurate attribution
     lumi_push_stream, lumi_audio_config = create_push_stream(24000)
-    lumi_recognizer = create_recognizer(lumi_audio_config, "ko-KR")
-
+    lumi_recognizer = create_recognizer(lumi_audio_config, "ko-KR") # Lumi
     rami_push_stream, rami_audio_config = create_push_stream(24000)
-    rami_recognizer = create_recognizer(rami_audio_config, "ko-KR")
+    rami_recognizer = create_recognizer(rami_audio_config, "ko-KR") # Rami
 
-    # Capture the main event loop
     loop = asyncio.get_running_loop()
-
-    # Track Full Transcript for Summarization
     session_transcript = []
 
-    # Callback to send audio back to client
     async def send_audio_to_client(audio_bytes: bytes, speaker_name: str):
         try:
-            # Send to Frontend
             await ws.send_bytes(audio_bytes)
-            
-            # Route to appropriate STT Stream
             if speaker_name == "lumi":
                 await asyncio.to_thread(lumi_push_stream.write, audio_bytes)
-                
             elif speaker_name == "rami":
                 await asyncio.to_thread(rami_push_stream.write, audio_bytes)
-            else:
-                # Fallback? Should not happen if speaker_name is strictly lumi/rami
-                pass
-            
         except Exception as e:
             print(f"[Server] Error sending audio to client: {e}")
 
-    # [NEW] Flush Helper to force STT finalization
     async def flush_ai_stt(speaker_name: str):
-        """Inject silence to force STT segmentation/finalization"""
         try:
-            silence = bytes(24000 * 2 * 1) # 1.0 second of silence (24kHz * 2bytes * 1sec)
+            silence = bytes(24000 * 2 * 1) 
             if speaker_name == "lumi":
                 await asyncio.to_thread(lumi_push_stream.write, silence)
             elif speaker_name == "rami":
@@ -156,33 +159,17 @@ async def audio_websocket(ws: WebSocket):
         except Exception as e:
             print(f"[Server] Error flushing STT: {e}")
 
-    # Original Dual Persona Code (Restored)
     lumi_rami_manager = LumiRamiManager(ws_send_func=send_audio_to_client, flush_stt_func=flush_ai_stt)
     
-    # STT Event Handlers
     def on_recognized(args, role):
         if args.result.text:
             text = args.result.text
-            
-            # role is now EXPLICIT ("user", "lumi", "rami")
-            # No need for fuzzy "current_speaking_role" state
-            
-            print(f"[Server] STT Recorded ({role}): {text}") # [DEBUG]
-            
-            # Store for memory
+            print(f"[Server] STT Recorded ({role}): {text}")
             session_transcript.append(f"{role.upper()}: {text}")
-            
             payload = json.dumps({"type": "transcript", "role": role, "text": text})
-            
-            # [Fix 1] Robust Loop Handling
             if loop.is_running():
                 asyncio.run_coroutine_threadsafe(ws.send_text(payload), loop)
-                
-                # Feed STT result to LumiRamiManager
                 asyncio.run_coroutine_threadsafe(lumi_rami_manager.handle_stt_result(text, role), loop)
-
-            else:
-                print(f"[Error] Main loop is closed. Cannot send STT: {text}")
 
     user_recognizer.recognized.connect(lambda evt: on_recognized(evt, "user"))
     lumi_recognizer.recognized.connect(lambda evt: on_recognized(evt, "lumi"))
@@ -193,15 +180,8 @@ async def audio_websocket(ws: WebSocket):
     rami_recognizer.start_continuous_recognition()
 
     try:
-        # Start Lumi/Rami Manager
-        await lumi_rami_manager.start()
-
-        # Ingest Memory Context if available
-        # We can push this as a system message to both
-        if memory_context:
-            # await lumi_rami_manager.queues["lumi"].put(("text", f"[System] Memory Context:\n{memory_context}"))
-            # await lumi_rami_manager.queues["rami"].put(("text", f"[System] Memory Context:\n{memory_context}"))
-            pass
+        # Start Lumi/Rami Manager with DUAL MEMORY
+        await lumi_rami_manager.start(lumi_memory=lumi_mem_str, rami_memory=rami_mem_str)
         
         async def receive_from_client():
             try:
