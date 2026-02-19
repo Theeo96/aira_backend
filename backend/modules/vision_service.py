@@ -27,6 +27,9 @@ class VisionService:
         if not image_bytes:
             return
         now_ts = time.monotonic()
+        # Keep latest frame snapshot synced so query-time snapshot turn uses the newest view.
+        self.camera_state["latest_snapshot"] = bytes(image_bytes)
+        self.camera_state["snapshot_ts"] = now_ts
         if now_ts - float(self.camera_state.get("last_frame_ts") or 0.0) < self.min_interval_sec:
             return
         session_obj = session_ref.get("obj")
@@ -51,9 +54,12 @@ class VisionService:
     async def set_camera_enabled(self, enabled: bool, inject_live_context_now):
         camera_on = bool(enabled)
         self.camera_state["enabled"] = camera_on
-        if not camera_on:
-            self.camera_state["frames_sent"] = 0
-            self.camera_state["snapshot_updates"] = 0
+        # Reset cached visual state on every camera mode transition to avoid stale-scene reuse.
+        self.camera_state["frames_sent"] = 0
+        self.camera_state["snapshot_updates"] = 0
+        self.camera_state["latest_snapshot"] = None
+        self.camera_state["snapshot_ts"] = 0.0
+        self.camera_state["last_frame_ts"] = 0.0
         self.log(f"[Vision] Camera state changed: enabled={camera_on}")
         if camera_on:
             await inject_live_context_now(
@@ -108,6 +114,17 @@ class VisionService:
         if (
             isinstance(snapshot_bytes, (bytes, bytearray))
             and (time.monotonic() - snapshot_ts) <= self.snapshot_ttl_sec
+        ):
+            return bytes(snapshot_bytes)
+        return None
+
+    def get_recent_snapshot(self, max_age_sec: float | None = None) -> bytes | None:
+        snapshot_bytes = self.camera_state.get("latest_snapshot")
+        snapshot_ts = float(self.camera_state.get("snapshot_ts") or 0.0)
+        ttl = float(max_age_sec) if max_age_sec is not None else float(self.snapshot_ttl_sec)
+        if (
+            isinstance(snapshot_bytes, (bytes, bytearray))
+            and (time.monotonic() - snapshot_ts) <= ttl
         ):
             return bytes(snapshot_bytes)
         return None

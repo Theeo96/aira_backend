@@ -231,6 +231,20 @@ def _is_vision_related_query(text: str) -> bool:
     return any(k in t.lower() for k in keywords)
 
 
+def _is_vision_followup_utterance(text: str) -> bool:
+    t = str(text or "").strip()
+    if not t:
+        return False
+    compact = re.sub(r"[\s\W_]+", "", t)
+    if len(compact) <= 8:
+        return True
+    hints = [
+        "지금", "이번엔", "그럼", "다시", "이건", "저건", "그건",
+        "어때", "맞아", "아니", "들고", "보여", "보이나", "잘안",
+    ]
+    return any(h in t for h in hints)
+
+
 def _normalize_place_name(name: str | None) -> str:
     if not name:
         return ""
@@ -1194,6 +1208,34 @@ async def audio_websocket(ws: WebSocket):
             turn_complete=True,
         )
 
+    async def _send_user_text_with_snapshot_turn(user_text: str, snapshot_bytes: bytes):
+        session_obj = session_ref.get("obj")
+        if not session_obj:
+            return
+        import base64 as _b64
+        frame_tag = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%H:%M:%S")
+        parts = [
+            {
+                "text": (
+                    "[VISION TURN]\n"
+                    f"Frame time: {frame_tag} KST.\n"
+                    "Prioritize this attached current frame first.\n"
+                    "Only use memory if it does not conflict with the frame."
+                )
+            },
+            {"text": f"사용자 질문: {str(user_text or '')}"},
+            {
+                "inline_data": {
+                    "mime_type": "image/jpeg",
+                    "data": _b64.b64encode(snapshot_bytes).decode("utf-8"),
+                }
+            },
+        ]
+        await session_obj.send_client_content(
+            turns=[{"role": "user", "parts": parts}],
+            turn_complete=True,
+        )
+
     async def _inject_guarded_context_turn(context_text: str):
         try:
             await _inject_live_context_now(context_text, complete_turn=True)
@@ -1307,31 +1349,24 @@ async def audio_websocket(ws: WebSocket):
                             loop,
                         )
 
-                    snapshot_bytes = vision_service.get_recent_snapshot_for_query(
-                        text,
-                        _is_vision_related_query,
-                    )
-                    if snapshot_bytes and loop.is_running():
-                            asyncio.run_coroutine_threadsafe(
-                                vision_service.send_frame_to_gemini(
-                                    session_ref=session_ref,
-                                    inject_live_context_now=_inject_live_context_now,
-                                    image_bytes=snapshot_bytes,
-                                    mime_type="image/jpeg",
-                                ),
-                                loop,
-                            )
-                            asyncio.run_coroutine_threadsafe(
-                                _inject_live_context_now(
-                                    "[VISION] Recent visual context is available for this turn. "
-                                    "Use visual context if relevant.",
-                                    complete_turn=False,
-                                ),
-                                loop,
-                            )
-
                     normalized_user_text = re.sub(r"[\s\W_]+", "", str(text or ""))
                     now_ts = time.monotonic()
+
+                    camera_on = bool(vision_service.camera_state.get("enabled", False))
+                    explicit_vision = _is_vision_related_query(text)
+                    inferred_vision = camera_on and _is_vision_followup_utterance(text)
+                    is_vision_query = explicit_vision or inferred_vision
+                    snapshot_bytes = (
+                        vision_service.get_recent_snapshot(max_age_sec=12.0)
+                        if camera_on
+                        else None
+                    )
+                    if is_vision_query and snapshot_bytes and loop.is_running():
+                        _submit_coroutine(
+                            _send_user_text_with_snapshot_turn(text, snapshot_bytes),
+                            label="vision_turn_with_snapshot",
+                        )
+                        return
                     # Azure STT can emit near-duplicate finalized chunks; skip fast duplicates.
                     if (
                         normalized_user_text
@@ -2007,5 +2042,3 @@ if __name__ == "__main__":
     import uvicorn
     # Use use_colors=False to fix ANSI escape sequences on Windows CMD
     uvicorn.run(app, host="0.0.0.0", port=8000, use_colors=False)
-
-
