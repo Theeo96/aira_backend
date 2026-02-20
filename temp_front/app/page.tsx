@@ -35,10 +35,22 @@ export default function Home() {
     };
   }, []);
 
-  // Auto-scroll to bottom
+  // Auto-Login Check (URL Query Param)
   useEffect(() => {
-    chatBottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [transcripts]);
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      const tokenFromUrl = params.get("token");
+      if (tokenFromUrl) {
+        // Auto Login!
+        setUserToken(tokenFromUrl);
+        localStorage.setItem("google_user_token", tokenFromUrl);
+
+        // Clean URL (remove token)
+        const newUrl = window.location.protocol + "//" + window.location.host + window.location.pathname;
+        window.history.replaceState({ path: newUrl }, "", newUrl);
+      }
+    }
+  }, []);
 
   const handleLogin = () => {
     const token = loginInput.trim();
@@ -59,7 +71,10 @@ export default function Home() {
   };
 
   const openGoogleLogin = () => {
-    window.open("https://8ai-th-loginback-atcyfgfcgbfxcvhx.koreacentral-01.azurewebsites.net/login", "_blank");
+    // Pass current origin as redirect_target
+    const target = typeof window !== "undefined" ? window.location.origin : "http://localhost:3000";
+    const loginUrl = `https://8ai-th-loginback-atcyfgfcgbfxcvhx.koreacentral-01.azurewebsites.net/login?redirect_target=${encodeURIComponent(target)}`;
+    window.location.href = loginUrl; // Redirect in same tab for smoother flow (or open in new tab if preferred)
   };
 
   const connectWebSocket = useCallback(() => {
