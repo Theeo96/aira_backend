@@ -40,6 +40,7 @@ from modules import runtime_env as runtime_env_utils
 from modules import route_text_utils
 from modules.fast_intent_router import fast_route_intent as fast_route_intent_core
 from modules.transit_runtime_service import TransitRuntimeService
+from modules.lumirami import LumiRamiManager
 
 from contextlib import asynccontextmanager
 
@@ -74,7 +75,7 @@ ENV_CACHE_TTL_SEC = float(os.getenv("ENV_CACHE_TTL_SEC", "300"))
 # Azure Speech Config
 AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
 AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
-SEOUL_API_KEY = os.getenv("SEOUL_API_KEY") or os.getenv("Seoul_API")
+SEOUL_API_KEY = os.getenv("SEOUL_API_KEY")
 ODSAY_API_KEY = os.getenv("ODSAY_API_KEY")
 TMAP_APP_KEY = os.getenv("TMAP_APP_KEY")
 HOME_LAT = os.getenv("HOME_LAT")
@@ -86,7 +87,7 @@ AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION")
 AZURE_OPENAI_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
 INTENT_ROUTER_MODEL = os.getenv("INTENT_ROUTER_MODEL") or AZURE_OPENAI_DEPLOYMENT_NAME or "gpt-4o-mini"
 ENABLE_TRANSIT_FILLER = os.getenv("ENABLE_TRANSIT_FILLER", "false").strip().lower() in {"1", "true", "yes", "on"}
-STT_SEGMENTATION_SILENCE_TIMEOUT_MS = os.getenv("STT_SEGMENTATION_SILENCE_TIMEOUT_MS", "280")
+STT_SEGMENTATION_SILENCE_TIMEOUT_MS = os.getenv("STT_SEGMENTATION_SILENCE_TIMEOUT_MS", "800")
 AI_STT_SEGMENTATION_SILENCE_TIMEOUT_MS = os.getenv("AI_STT_SEGMENTATION_SILENCE_TIMEOUT_MS", "900")
 AI_FLUSH_SILENCE_AFTER_SEC = float(os.getenv("AI_FLUSH_SILENCE_AFTER_SEC", "1.2"))
 AI_FLUSH_SILENCE_SEC = float(os.getenv("AI_FLUSH_SILENCE_SEC", "0.15"))
@@ -285,24 +286,43 @@ async def audio_websocket(ws: WebSocket):
         return
 
     # 2. Load Memory (Context)
-    # Fetch ALL past summaries for this user
-    # Fetch ALL past summaries for this user (Blocking I/O -> Async Thread)
-    # past_memories = cosmos_service.get_all_memories(user_id) 
     past_memories = await asyncio.to_thread(cosmos_service.get_all_memories, user_id)
-    memory_context = ""
-    if past_memories:
-        memory_context = "Here is the summary of past conversations with this user:\n"
-        for item in past_memories:
-            summary = item.get("summary", {})
-            context_text = summary.get("context_summary", "No summary")
-            date = item.get("date", "Unknown Date")
-            memory_context += f"- [{date}] {context_text}\n"
-        
-        print(f"[Memory] Loaded {len(past_memories)} past conversation summaries.")
-
-    # Initialize Gemini
-    client = genai.Client(api_key=API_KEY)
+    lumi_mem_str = ""
+    rami_mem_str = ""
     
+    if past_memories:
+        print(f"[Memory] Loaded {len(past_memories)} past conversation summaries.")
+        lumi_items = []
+        rami_items = []
+        for item in past_memories:
+            date = item.get("date", "Unknown Date")
+            summary = item.get("summary", {})
+            
+            # [Lumi Context]
+            if "lumi_summary" in summary:
+                lumi_items.append(f"- [{date}] {summary['lumi_summary']}")
+            elif "summary_lumi" in summary: # Legacy structure
+                lumi_items.append(f"- [{date}] {summary['summary_lumi'].get('context_summary', '')}")
+            else:
+                # Fallback to shared context
+                content = summary.get("context_summary", "")
+                if content: lumi_items.append(f"- [{date}] {content}")
+
+            # [Rami Context]
+            if "rami_summary" in summary:
+                rami_items.append(f"- [{date}] {summary['rami_summary']}")
+            elif "summary_rami" in summary: # Legacy structure
+                rami_items.append(f"- [{date}] {summary['summary_rami'].get('context_summary', '')}")
+            else:
+                # Fallback to shared context
+                content = summary.get("context_summary", "")
+                if content: rami_items.append(f"- [{date}] {content}")
+        
+        if lumi_items:
+            lumi_mem_str = "You recall these past events:\n" + "\n".join(lumi_items)
+        if rami_items:
+            rami_mem_str = "You recall these past events:\n" + "\n".join(rami_items)
+
     user_profile = await asyncio.to_thread(cosmos_service.get_user_profile, user_id)
     saved_home_destination = None
     if isinstance(user_profile, dict):
@@ -317,52 +337,24 @@ async def audio_websocket(ws: WebSocket):
     env_cache = {"weather": {}, "air": {}, "lat": current_lat, "lng": current_lng, "ts": 0.0}
     news_state = {"topic": "", "items": [], "selected": None, "ts": 0.0}
 
-    # Inject Memory into System Instruction
-    system_instruction = (
-        "You are Aira, a warm and practical Korean voice assistant. "
-        "For transit/city/weather/air-quality/restaurant/news topics, never fabricate facts. "
-        "Only state information that is explicitly present in provided live context. "
-        "If required data is missing, say what is missing and ask one concise follow-up question. "
-        "For subway guidance, include departure station, line/direction, ETA, walking minutes, and whether to take current or next train only when present in live context. "
-        "For bus guidance, provide bus number, boarding stop name, and walking minutes when present in live context. "
-        "Do not invent route, direction, ETA, weather, air-quality, or restaurant details. "
-        "Do not mention crowding/congestion unless explicit congestion data is provided in live context. "
-        "For Korean transit questions, never ask user's current location; device coordinates are already provided by server. "
-        "If visual context is provided from camera/screen, use it naturally together with voice context. "
-        "When visual context is available, do not say phrases like '보내주신 이미지', '사진에서', "
-        "'실시간 화면을 볼 수 없다'. Refer naturally to the current screen "
-        "(e.g., '지금 화면에서 ...')."
-    )
-    if current_lat is not None and current_lng is not None:
-        system_instruction += (
-            " Current location is already known from device coordinates. "
-            "Do not ask the user where they are. "
-            f"Known coordinates: lat={current_lat}, lng={current_lng}."
-        )
-    if memory_context:
-        system_instruction += f"\n\n[MEMORY LOADED]\n{memory_context}\nUse this context to personalize your responses."
-    # Do not pin a preloaded route in system instruction.
-    # Route context should be injected per-turn to avoid stale destination bias.
-
-    config = {
-        "response_modalities": ["AUDIO"],
-        "speech_config": {
-            "voice_config": {"prebuilt_voice_config": {"voice_name": "Aoede"}}
-        },
-        "system_instruction": system_instruction
-    }
-
     # Initialize Azure STT (User: 16kHz, AI: 24kHz)
     user_push_stream, user_audio_config = create_push_stream(16000)
     user_recognizer = create_recognizer(
         user_audio_config,
         "ko-KR",
         silence_timeout_ms=str(STT_SEGMENTATION_SILENCE_TIMEOUT_MS),
-    ) # Assuming Korean context based on user prompts
+    )
 
-    ai_push_stream, ai_audio_config = create_push_stream(24000)
-    ai_recognizer = create_recognizer(
-        ai_audio_config,
+    lumi_push_stream, lumi_audio_config = create_push_stream(24000)
+    lumi_recognizer = create_recognizer(
+        lumi_audio_config,
+        "ko-KR",
+        silence_timeout_ms=str(AI_STT_SEGMENTATION_SILENCE_TIMEOUT_MS),
+    )
+    
+    rami_push_stream, rami_audio_config = create_push_stream(24000)
+    rami_recognizer = create_recognizer(
+        rami_audio_config,
         "ko-KR",
         silence_timeout_ms=str(AI_STT_SEGMENTATION_SILENCE_TIMEOUT_MS),
     )
@@ -370,8 +362,35 @@ async def audio_websocket(ws: WebSocket):
     # Capture the main event loop
     loop = asyncio.get_running_loop()
 
+    async def send_audio_to_client(audio_bytes: bytes, speaker_name: str):
+        try:
+            await ws.send_bytes(audio_bytes)
+            if speaker_name == "lumi":
+                await asyncio.to_thread(lumi_push_stream.write, audio_bytes)
+                lumi_state["last_ai_write_time"] = time.monotonic()
+                lumi_state["flushed"] = False
+            elif speaker_name == "rami":
+                await asyncio.to_thread(rami_push_stream.write, audio_bytes)
+                rami_state["last_ai_write_time"] = time.monotonic()
+                rami_state["flushed"] = False
+        except Exception as e:
+            print(f"[Server] Error sending audio for {speaker_name}: {e}")
+
+    async def flush_ai_stt(speaker_name: str):
+        try:
+            silence = bytes(24000 * 2 * 1) 
+            if speaker_name == "lumi":
+                await asyncio.to_thread(lumi_push_stream.write, silence)
+            elif speaker_name == "rami":
+                await asyncio.to_thread(rami_push_stream.write, silence)
+        except Exception as e:
+            pass
+
+    lumi_rami_manager = LumiRamiManager(ws_send_func=send_audio_to_client, flush_stt_func=flush_ai_stt)
+
     # Track state for Smart Flushing
-    state = {"last_ai_write_time": 0, "flushed": False}
+    lumi_state = {"last_ai_write_time": 0.0, "flushed": True}
+    rami_state = {"last_ai_write_time": 0.0, "flushed": True}
     vision_service = VisionService(
         min_interval_sec=CAMERA_FRAME_MIN_INTERVAL_SEC,
         snapshot_ttl_sec=VISION_SNAPSHOT_TTL_SEC,
@@ -426,22 +445,13 @@ async def audio_websocket(ws: WebSocket):
     }
 
     async def _inject_live_context_now(context_text: str, complete_turn: bool = False):
-        session_obj = session_ref.get("obj")
-        if not session_obj:
+        if not getattr(lumi_rami_manager, "running", False):
             async with dynamic_context_lock:
                 dynamic_contexts.append(context_text)
             return
-        await session_obj.send_client_content(
-            turns=[
-                {
-                    "role": "user",
-                    "parts": [
-                        {"text": "[LIVE_CONTEXT_UPDATE]\n" + context_text + "\nUse this for current answer."}
-                    ],
-                }
-            ],
-            turn_complete=complete_turn,
-        )
+        payload = "[LIVE_CONTEXT_UPDATE]\n" + context_text + "\nUse this for current answer."
+        for name, q in lumi_rami_manager.queues.items():
+            await q.put(("text", payload))
 
     proactive_service = ProactiveService(
         response_guard=response_guard,
@@ -492,7 +502,9 @@ async def audio_websocket(ws: WebSocket):
         clean_text = str(text or "").strip()
         if not clean_text:
             return
-        role_norm = "user" if str(role or "").strip().lower() == "user" else "ai"
+        role_norm = str(role or "").strip().lower()
+        if role_norm not in ("user", "lumi", "rami"):
+            role_norm = "ai"
         normalized_text = re.sub(r"\s+", " ", clean_text)
         key = f"{role_norm}:{normalized_text}"
         now_ts = time.monotonic()
@@ -512,22 +524,14 @@ async def audio_websocket(ws: WebSocket):
             print(f"[Error] Main loop is closed. Cannot send STT: {clean_text}")
 
     async def _send_user_text_turn(user_text: str):
-        session_obj = session_ref.get("obj")
-        if not session_obj:
+        if not getattr(lumi_rami_manager, "running", False):
             return
-        await session_obj.send_client_content(
-            turns=[
-                {
-                    "role": "user",
-                    "parts": [{"text": str(user_text or "")}],
-                }
-            ],
-            turn_complete=True,
-        )
+        payload = [{"role": "user", "parts": [{"text": str(user_text or "")}]}]
+        for name, q in lumi_rami_manager.queues.items():
+            await q.put(("turns", payload))
 
     async def _send_user_text_with_snapshot_turn(user_text: str, snapshot_bytes: bytes):
-        session_obj = session_ref.get("obj")
-        if not session_obj:
+        if not getattr(lumi_rami_manager, "running", False):
             return
         import base64 as _b64
         frame_tag = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%H:%M:%S")
@@ -548,10 +552,9 @@ async def audio_websocket(ws: WebSocket):
                 }
             },
         ]
-        await session_obj.send_client_content(
-            turns=[{"role": "user", "parts": parts}],
-            turn_complete=True,
-        )
+        payload = [{"role": "user", "parts": parts}]
+        for name, q in lumi_rami_manager.queues.items():
+            await q.put(("turns", payload))
 
     async def _inject_guarded_context_turn(context_text: str):
         try:
@@ -580,7 +583,7 @@ async def audio_websocket(ws: WebSocket):
             add_followup_hint=add_followup_hint,
             max_chars=max_chars,
             max_sentences=max_sentences,
-            split_by_sentence=split_by_sentence,
+            split_by_sentence=False,
             chunk_max_sentences=chunk_max_sentences,
             chunk_max_chars=chunk_max_chars,
         )
@@ -871,9 +874,9 @@ async def audio_websocket(ws: WebSocket):
                             destination_state["name"] = home_candidate
                             destination_state["asked_once"] = False
                             if loop.is_running():
-                                asyncio.run_coroutine_threadsafe(
+                                _submit_coroutine(
                                     _save_home_destination(home_candidate),
-                                    loop,
+                                    label="save_home",
                                 )
                             print(f"[Profile] Home destination updated in-session: {home_candidate}")
 
@@ -1068,262 +1071,167 @@ async def audio_websocket(ws: WebSocket):
             now_ts + 1.5,
         )
 
-    user_recognizer.recognized.connect(lambda evt: on_recognized(evt, "user"))
-    ai_recognizer.recognized.connect(lambda evt: on_recognized(evt, "ai"))
+    def dual_on_recognized(args, role):
+        if args.result.text:
+            text = args.result.text
+            if loop.is_running():
+                asyncio.run_coroutine_threadsafe(lumi_rami_manager.handle_stt_result(text, role), loop)
+            on_recognized(args, role)
+
+    user_recognizer.recognized.connect(lambda evt: dual_on_recognized(evt, "user"))
+    lumi_recognizer.recognized.connect(lambda evt: dual_on_recognized(evt, "lumi"))
+    rami_recognizer.recognized.connect(lambda evt: dual_on_recognized(evt, "rami"))
     user_recognizer.recognizing.connect(lambda evt: on_recognizing(evt, "user"))
 
     user_recognizer.start_continuous_recognition()
-    ai_recognizer.start_continuous_recognition()
+    lumi_recognizer.start_continuous_recognition()
+    rami_recognizer.start_continuous_recognition()
 
     try:
-        async with client.aio.live.connect(model=MODEL_NAME, config=config) as session:
-            print("[Gemini] Connected to Live API")
-            session_ref["obj"] = session
-            await _preload_env_cache(force=True)
-            await _inject_initial_location_context()
-            state["last_ai_write_time"] = asyncio.get_running_loop().time()
-            
-            async def receive_from_client():
-                try:
-                    while True:
-                        msg = await ws.receive()
-                        msg_type = msg.get("type")
-                        if msg_type == "websocket.disconnect":
-                            print("[Server] WebSocket Disconnected (Receive Loop)")
-                            return
-                        if msg_type != "websocket.receive":
-                            continue
+        await lumi_rami_manager.start(lumi_memory=lumi_mem_str, rami_memory=rami_mem_str)
+        await _preload_env_cache(force=True)
+        await _inject_initial_location_context()
+        
+        async def receive_from_client():
+            try:
+                while True:
+                    msg = await ws.receive()
+                    msg_type = msg.get("type")
+                    if msg_type == "websocket.disconnect":
+                        print("[Server] WebSocket Disconnected (Receive Loop)")
+                        return
+                    if msg_type != "websocket.receive":
+                        continue
 
-                        text_data = msg.get("text")
-                        if text_data:
-                            try:
-                                payload = json.loads(text_data)
-                                if isinstance(payload, dict) and payload.get("type") == "location_update":
-                                    new_lat = _to_float(payload.get("lat"))
-                                    new_lng = _to_float(payload.get("lng"))
-                                    if new_lat is not None and new_lng is not None:
-                                        client_state["lat"] = new_lat
-                                        client_state["lng"] = new_lng
-                                        prev_lat = _to_float(client_state.get("last_log_lat"))
-                                        prev_lng = _to_float(client_state.get("last_log_lng"))
-                                        moved_m = None
-                                        if prev_lat is not None and prev_lng is not None:
-                                            moved_m = _haversine_meters(prev_lat, prev_lng, new_lat, new_lng)
-                                        # Reduce noisy logs: print only when movement is meaningful.
-                                        if moved_m is None or moved_m >= 25:
-                                            print(f"[SeoulInfo] Location updated lat={new_lat}, lng={new_lng}")
-                                            client_state["last_log_lat"] = new_lat
-                                            client_state["last_log_lng"] = new_lng
-                                        # Refresh cached weather/air in background when movement is meaningful.
-                                        if moved_m is None or moved_m >= 80:
-                                            asyncio.create_task(_preload_env_cache(force=False))
-                                        asyncio.create_task(
-                                            briefing_runtime.maybe_send_leaving_home_alert(
-                                                briefing_state=briefing_state,
-                                                current_gps={"lat": new_lat, "lng": new_lng},
-                                            )
+                    text_data = msg.get("text")
+                    if text_data:
+                        try:
+                            payload = json.loads(text_data)
+                            if isinstance(payload, dict) and payload.get("type") == "location_update":
+                                new_lat = _to_float(payload.get("lat"))
+                                new_lng = _to_float(payload.get("lng"))
+                                if new_lat is not None and new_lng is not None:
+                                    client_state["lat"] = new_lat
+                                    client_state["lng"] = new_lng
+                                    prev_lat = _to_float(client_state.get("last_log_lat"))
+                                    prev_lng = _to_float(client_state.get("last_log_lng"))
+                                    moved_m = None
+                                    if prev_lat is not None and prev_lng is not None:
+                                        moved_m = _haversine_meters(prev_lat, prev_lng, new_lat, new_lng)
+                                    if moved_m is None or moved_m >= 25:
+                                        print(f"[SeoulInfo] Location updated lat={new_lat}, lng={new_lng}")
+                                        client_state["last_log_lat"] = new_lat
+                                        client_state["last_log_lng"] = new_lng
+                                    if moved_m is None or moved_m >= 80:
+                                        asyncio.create_task(_preload_env_cache(force=False))
+                                    asyncio.create_task(
+                                        briefing_runtime.maybe_send_leaving_home_alert(
+                                            briefing_state=briefing_state,
+                                            current_gps={"lat": new_lat, "lng": new_lng},
                                         )
-                                        asyncio.create_task(
-                                            briefing_runtime.maybe_send_evening_local_alert(
-                                                briefing_state=briefing_state,
-                                                current_gps={"lat": new_lat, "lng": new_lng},
-                                                moved_m=moved_m,
-                                            )
+                                    )
+                                    asyncio.create_task(
+                                        briefing_runtime.maybe_send_evening_local_alert(
+                                            briefing_state=briefing_state,
+                                            current_gps={"lat": new_lat, "lng": new_lng},
+                                            moved_m=moved_m,
                                         )
-                                elif isinstance(payload, dict) and payload.get("type") == "camera_state":
-                                    await vision_service.set_camera_enabled(
-                                        enabled=bool(payload.get("enabled")),
-                                        inject_live_context_now=_inject_live_context_now,
                                     )
-                                elif isinstance(payload, dict) and payload.get("type") == "camera_frame_base64":
-                                    await vision_service.handle_camera_frame_payload(
-                                        payload=payload,
-                                        session_ref=session_ref,
-                                        inject_live_context_now=_inject_live_context_now,
-                                    )
-                                elif isinstance(payload, dict) and payload.get("type") == "camera_snapshot_base64":
-                                    await vision_service.handle_camera_snapshot_payload(
-                                        payload=payload,
-                                        session_ref=session_ref,
-                                        inject_live_context_now=_inject_live_context_now,
-                                    )
-                            except Exception:
-                                pass
-                            continue
-
-                        data = msg.get("bytes")
-                        # Ignore non-binary frames (e.g., text/control keepalive)
-                        if not data:
-                            continue
-
-                        # Safety release: if timed block elapsed, release hard block flag.
-                        if (
-                            (not response_guard.get("active"))
-                            and response_guard.get("block_direct_audio")
-                            and time.monotonic() >= float(response_guard.get("block_direct_audio_until") or 0.0)
-                        ):
-                            response_guard["block_direct_audio"] = False
-
-                        # Inject freshest per-turn live context before audio chunk when available.
-                        injected_context = None
-                        async with dynamic_context_lock:
-                            if dynamic_contexts:
-                                injected_context = dynamic_contexts.pop()
-                                dynamic_contexts.clear()
-                        if injected_context:
-                            try:
-                                await session.send_client_content(
-                                    turns=[
-                                        {
-                                            "role": "user",
-                                            "parts": [
-                                                {
-                                                    "text": (
-                                                        "[LIVE_CONTEXT_UPDATE]\n"
-                                                        + injected_context
-                                                        + "\nUse this for current answer."
-                                                    )
-                                                }
-                                            ],
-                                        }
-                                    ],
-                                    turn_complete=False,
+                            elif isinstance(payload, dict) and payload.get("type") == "camera_state":
+                                await vision_service.set_camera_enabled(
+                                    enabled=bool(payload.get("enabled")),
+                                    inject_live_context_now=_inject_live_context_now,
                                 )
-                                # Live context was pushed; release output/input gate quickly
-                                # so user does not feel unnecessary latency.
-                                transit_turn_gate["until"] = min(
-                                    float(transit_turn_gate.get("until") or 0.0),
-                                    time.monotonic() + 0.15,
+                            elif isinstance(payload, dict) and payload.get("type") == "camera_frame_base64":
+                                await vision_service.handle_camera_frame_payload(
+                                    payload=payload,
+                                    session_ref=session_ref,
+                                    inject_live_context_now=_inject_live_context_now,
                                 )
-                            except Exception as e:
-                                print(f"[SeoulInfo] context injection failed: {e}")
-                        if (
-                            EFFECTIVE_GEMINI_DIRECT_AUDIO_INPUT
-                            and (not response_guard.get("active"))
-                            and (not response_guard.get("block_direct_audio"))
-                            and time.monotonic() >= float(response_guard.get("block_direct_audio_until") or 0.0)
-                            and time.monotonic() >= float(response_guard.get("post_context_audio_hold_until") or 0.0)
-                            and time.monotonic() >= float(transit_turn_gate.get("until") or 0.0)
-                        ):
-                            await session.send_realtime_input(audio={"data": data, "mime_type": "audio/pcm;rate=16000"})
-                        # [Fix] Pushing to Azure Stream might block if internal buffer is full. Offload to thread.
-                        await asyncio.to_thread(user_push_stream.write, data)
-                except WebSocketDisconnect:
-                    print("[Server] WebSocket Disconnected (Receive Loop)")
-                    return # Clean exit logic will be handled by finally block
-                except Exception as e:
-                    print(f"[Server] Error processing input: {e}")
+                            elif isinstance(payload, dict) and payload.get("type") == "camera_snapshot_base64":
+                                await vision_service.handle_camera_snapshot_payload(
+                                    payload=payload,
+                                    session_ref=session_ref,
+                                    inject_live_context_now=_inject_live_context_now,
+                                )
+                        except Exception:
+                            pass
+                        continue
 
-            async def send_to_client():
-                try:
-                    while True:
-                        async for response in session.receive():
-                            if response.server_content and response.server_content.model_turn:
-                                for part in response.server_content.model_turn.parts:
-                                    if part.inline_data:
-                                        audio_bytes = part.inline_data.data
-                                        # Drop model audio during user speech capture/finalization window.
-                                        if time.monotonic() < float(speech_capture_gate.get("until") or 0.0):
-                                            continue
-                                        # Suppress premature model audio while live-context turn is being prepared.
-                                        if time.monotonic() < float(transit_turn_gate.get("until") or 0.0):
-                                            continue
-                                        # Drop any model audio before live context is sent for this guarded turn.
-                                        if response_guard.get("active") and (not response_guard.get("context_sent")):
-                                            continue
-                                        await ws.send_bytes(audio_bytes)
-                                        # [Fix] Offload AI audio write to thread
-                                        await asyncio.to_thread(ai_push_stream.write, audio_bytes)
-                                        # Update state: Audio received, not flushed yet
-                                        state["last_ai_write_time"] = asyncio.get_running_loop().time()
-                                        state["flushed"] = False
+                    data = msg.get("bytes")
+                    if not data:
+                        continue
+
+                    if (
+                        (not response_guard.get("active"))
+                        and response_guard.get("block_direct_audio")
+                        and time.monotonic() >= float(response_guard.get("block_direct_audio_until") or 0.0)
+                    ):
+                        response_guard["block_direct_audio"] = False
+
+                    injected_context = None
+                    async with dynamic_context_lock:
+                        if dynamic_contexts:
+                            injected_context = dynamic_contexts.pop()
+                            dynamic_contexts.clear()
+                    if injected_context:
+                        try:
+                            payload = "[LIVE_CONTEXT_UPDATE]\n" + injected_context + "\nUse this for current answer."
+                            for name, q in lumi_rami_manager.queues.items():
+                                await q.put(("text", payload))
+                            transit_turn_gate["until"] = min(
+                                float(transit_turn_gate.get("until") or 0.0),
+                                time.monotonic() + 0.15,
+                            )
+                        except Exception as e:
+                            print(f"[SeoulInfo] context injection failed: {e}")
                             
-                            # [Fix 3] Monitor Gemini Turn Complete
-                            if response.server_content and response.server_content.turn_complete:
-                                if response_guard.get("active") and response_guard.get("context_sent"):
-                                    # No stale audio detected; normal guarded turn complete.
-                                    response_guard["active"] = False
-                                    response_guard["block_direct_audio"] = False
-                                    response_guard["block_direct_audio_until"] = 0.0
-                                    response_guard["post_context_audio_hold_until"] = time.monotonic() + 0.9
-                                    response_guard["active_since"] = 0.0
-                                    response_guard["context_sent_at"] = 0.0
-                                    response_guard["pending_intent"] = None
-                                    response_guard["pending_context_summary"] = ""
-                                    response_guard["pending_action_instruction"] = ""
-                                    response_guard["pending_user_text"] = ""
-                                    response_guard["retry_issued"] = False
-                                    response_guard["forced_intent_turn"] = None
-
-                except Exception as e:
-                    print(f"[Server] Error processing output: {e}")
-                    # Don't raise here, allow silence injector to keep running or clean exit
-
-            # [Smart Flush]
-            async def smart_flush_injector():
-                # 24kHz, 16-bit mono => bytes_per_second = 48000
-                silence_chunk = b"\x00" * int(max(1, AI_FLUSH_SILENCE_SEC) * 48000)
-                last_flush_ts = 0.0
-                try:
-                    while True:
-                        await asyncio.sleep(0.1) # Check every 100ms
-                        now = asyncio.get_running_loop().time()
-                        now_mono = time.monotonic()
+                    if (
+                        EFFECTIVE_GEMINI_DIRECT_AUDIO_INPUT
+                        and (not response_guard.get("active"))
+                        and (not response_guard.get("block_direct_audio"))
+                        and time.monotonic() >= float(response_guard.get("block_direct_audio_until") or 0.0)
+                        and time.monotonic() >= float(response_guard.get("post_context_audio_hold_until") or 0.0)
+                        and time.monotonic() >= float(transit_turn_gate.get("until") or 0.0)
+                    ):
+                        await lumi_rami_manager.push_audio(data)
                         
-                        # Flush only when pause is meaningful; avoid over-fragmenting AI STT transcript.
-                        if (
-                            (now - state["last_ai_write_time"] > AI_FLUSH_SILENCE_AFTER_SEC)
-                            and (not state["flushed"])
-                            and (not response_guard.get("active"))
-                            and (now_mono - last_flush_ts > AI_FLUSH_MIN_INTERVAL_SEC)
-                        ):
-                            print("[STT] Pause detected. Injecting silence to flush buffer.")
-                            await asyncio.to_thread(ai_push_stream.write, silence_chunk)
-                            state["flushed"] = True # Mark as flushed to STOP sending silence
-                            last_flush_ts = now_mono
+                    await asyncio.to_thread(user_push_stream.write, data)
+            except WebSocketDisconnect:
+                print("[Server] WebSocket Disconnected (Receive Loop)")
+                return
+            except Exception as e:
+                print(f"[Server] Error processing input: {e}")
 
-                        # Guard watchdog:
-                        # Do not inject user-text retry here (it can cause "정보 없음" pre-utterance).
-                        # Just release deadlock if guarded turn stays silent too long.
-                        if (
-                            response_guard.get("active")
-                            and response_guard.get("context_sent")
-                            and (now_mono - float(response_guard.get("context_sent_at") or response_guard.get("active_since") or 0.0) > 4.0)
-                        ):
-                            print("[Guard] no output after context turn; releasing guard")
-                            response_guard["active"] = False
-                            response_guard["context_sent"] = False
-                            response_guard["suppressed_audio_seen"] = False
-                            response_guard["block_direct_audio"] = False
-                            response_guard["block_direct_audio_until"] = 0.0
-                            response_guard["post_context_audio_hold_until"] = 0.0
-                            response_guard["active_since"] = 0.0
-                            response_guard["context_sent_at"] = 0.0
-                            response_guard["pending_intent"] = None
-                            response_guard["pending_context_summary"] = ""
-                            response_guard["pending_action_instruction"] = ""
-                            response_guard["pending_user_text"] = ""
-                            response_guard["retry_issued"] = False
-                            response_guard["forced_intent_turn"] = None
-                            
-                except asyncio.CancelledError:
-                    pass
-                except Exception as e:
-                    print(f"[Server] Smart Flush Error: {e}")
+        # Run tasks
+        async def smart_flush_injector():
+            silence_chunk = b"\x00" * int(max(1, AI_FLUSH_SILENCE_SEC) * 48000)
+            try:
+                while True:
+                    await asyncio.sleep(0.1)
+                    now_mono = time.monotonic()
+                    
+                    if (now_mono - lumi_state["last_ai_write_time"] > AI_FLUSH_SILENCE_AFTER_SEC) and not lumi_state["flushed"]:
+                        await asyncio.to_thread(lumi_push_stream.write, silence_chunk)
+                        lumi_state["flushed"] = True
+                        
+                    if (now_mono - rami_state["last_ai_write_time"] > AI_FLUSH_SILENCE_AFTER_SEC) and not rami_state["flushed"]:
+                        await asyncio.to_thread(rami_push_stream.write, silence_chunk)
+                        rami_state["flushed"] = True
+            except asyncio.CancelledError:
+                pass
 
-            # Run tasks
-            tasks = [
-                asyncio.create_task(receive_from_client()),
-                asyncio.create_task(send_to_client()),
-                asyncio.create_task(smart_flush_injector()),
-            ]
-            if MORNING_BRIEFING is not None:
-                tasks.append(asyncio.create_task(briefing_runtime.scheduler_loop(briefing_state)))
-            done, pending = await asyncio.wait(
-                tasks,
-                return_when=asyncio.FIRST_COMPLETED
-            )
-            for task in pending: task.cancel()
+        tasks = [
+            asyncio.create_task(receive_from_client()),
+            asyncio.create_task(smart_flush_injector()),
+        ]
+        if MORNING_BRIEFING is not None:
+            tasks.append(asyncio.create_task(briefing_runtime.scheduler_loop(briefing_state)))
+        done, pending = await asyncio.wait(
+            tasks,
+            return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending: task.cancel()
 
     except Exception as e:
         print(f"[Server] Session Error or Disconnect: {e}")
@@ -1332,11 +1240,11 @@ async def audio_websocket(ws: WebSocket):
         session_ref["obj"] = None
         print("[Server] Cleaning up resources...")
         await timer_service.shutdown()
+        await lumi_rami_manager.stop()
         try:
-            # Execute cleanup asynchronously with TIMEOUT to avoid blocking the Event Loop
-            # If Azure takes too long to stop, we just abandon it to prevent "Waiting for child process" hang.
             await asyncio.wait_for(asyncio.to_thread(user_recognizer.stop_continuous_recognition), timeout=2.0)
-            await asyncio.wait_for(asyncio.to_thread(ai_recognizer.stop_continuous_recognition), timeout=2.0)
+            await asyncio.wait_for(asyncio.to_thread(lumi_recognizer.stop_continuous_recognition), timeout=2.0)
+            await asyncio.wait_for(asyncio.to_thread(rami_recognizer.stop_continuous_recognition), timeout=2.0)
         except Exception as e:
             print(f"[Server] Cleanup Warning: {e}")
         try: await ws.close() 
@@ -1345,15 +1253,15 @@ async def audio_websocket(ws: WebSocket):
 
         # 3. Save Memory (Summarization)
         if session_transcript and len(session_transcript) > 2: # Don't save empty sessions
-            print("[Memory] Summarizing session...")
+            print("[Memory] Summarizing session (Dual)...")
             full_text = "\n".join(session_transcript)
             
             # Blocking I/O -> Async Thread
-            summary_json = await asyncio.to_thread(memory_service.summarize, full_text)
+            summary_json = await asyncio.to_thread(memory_service.summarize_dual, full_text)
             
-            if summary_json and summary_json.get("context_summary"):
+            if summary_json:
                 await asyncio.to_thread(cosmos_service.save_memory, user_id, full_text, summary_json)
-                print(f"[Memory] Session saved for {user_id}")
+                print(f"[Memory] Dual Session saved for {user_id}")
             else:
                 print("[Memory] Skipped saving: Summary is empty or invalid.")
 

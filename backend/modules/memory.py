@@ -85,4 +85,63 @@ class MemoryService:
             print(f"[Memory] Summarization Error: {e}")
             return None
 
+    def summarize_dual(self, transcript):
+        """
+        Generates two separate summaries (Lumi/Rami) for context, 
+        but a unified User Sentiment Analysis.
+        """
+        if not self.client or not transcript.strip():
+            return None
+
+        system_prompt = """
+        You are an AI assistant that summarizes conversation transcripts into a JSON format for TWO different personas.
+        
+        [Input]
+        - Transcript of a conversation where lines are prefixed with speakers: "USER: ", "LUMI: ", or "RAMI: ".
+        - ONLY lines starting with "USER: " represent the User's factual words and emotions.
+        - DO NOT attribute words spoken by "LUMI: " or "RAMI: " to the User.
+        - IMPORTANT: Lumi and Rami are the AI assistants. The USER is the human.
+        
+        [Goal]
+        - Generate TWO summaries based on the distinct perspectives of Lumi and Rami.
+        - Analyze the User's overall sentiment, status, and target (based ONLY on what the "USER: " said).
+        
+        [Persona Definitions]
+        1. **Lumi**: 따뜻하고 감성적인 '너'('친구')를 챙기는 반말투 페르소나. 요약 작성 시 이 말투와 관점을 100% 유지해.
+        2. **Rami**: 직설적이고 이성적이며 팩트와 일정을 챙기는 반말투 페르소나. 요약 작성 시 이 말투와 관점을 100% 유지해.
+        
+        [Instructions]
+        - 반드시 "USER" 단어 대신 "사용자"라는 단어를 사용해서 요약할 것.
+        - lumi_summary와 rami_summary 안에 기록하는 모든 문장(요약)은 각자의 페르소나 성격에 완전히 부합하는 '한국어 반말'로 자연스럽게 작성할 것. (예: "사용자가 날씨를 물어보길래 우산을 챙기라고 말해줬어.")
+        - Identify the user's primary emotion from the predefined groups.
+        - Determine the status (Positive/Negative).
+        - Identify the target of the emotion.
+
+        [Output JSON Format]
+        {
+            "lumi_summary": "Summary focused on emotions/feelings (Korean)",
+            "rami_summary": "Summary focused on facts/tasks (Korean)",
+            "sentiment": "One of 32 Emotion Tags (e.g., Excited, Sad, Grateful, etc.)",
+            "status": "Positive or Negative (Group Name)",
+            "target": "Target (Self/Friend/etc)"
+        }
+        """
+
+        try:
+            response = self.client.chat.completions.create(
+                model=AZURE_OPENAI_DEPLOYMENT_NAME,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"<transcript>\n{transcript}\n</transcript>"}
+                ],
+                response_format={ "type": "json_object" }
+            )
+            
+            result_json_str = response.choices[0].message.content
+            return json.loads(result_json_str)
+
+        except Exception as e:
+            print(f"[Memory] Dual Summarization Error: {e}")
+            return None
+
 memory_service = MemoryService()

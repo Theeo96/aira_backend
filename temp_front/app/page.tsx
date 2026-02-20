@@ -4,7 +4,7 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { Camera, CameraOff, Mic, MicOff, Monitor, MonitorOff } from "lucide-react";
 
 type TranscriptMessage = {
-  role: "user" | "ai";
+  role: "user" | "ai" | "lumi" | "rami";
   text: string;
 };
 
@@ -62,6 +62,20 @@ export default function Home() {
     chatBottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [transcripts]);
 
+  // Auto-Login Check (URL Query Param)
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      const tokenFromUrl = params.get("token");
+      if (tokenFromUrl) {
+        setUserToken(tokenFromUrl);
+        localStorage.setItem("google_user_token", tokenFromUrl);
+        const newUrl = window.location.protocol + "//" + window.location.host + window.location.pathname;
+        window.history.replaceState({ path: newUrl }, "", newUrl);
+      }
+    }
+  }, []);
+
   const handleLogin = () => {
     const token = loginInput.trim();
     if (token.includes("@") && token.includes(".")) {
@@ -83,7 +97,9 @@ export default function Home() {
   };
 
   const openGoogleLogin = () => {
-    window.open("https://8ai-th-loginback-atcyfgfcgbfxcvhx.koreacentral-01.azurewebsites.net/login", "_blank");
+    const target = typeof window !== "undefined" ? window.location.origin : "http://localhost:3000";
+    const loginUrl = `https://8ai-th-loginback-atcyfgfcgbfxcvhx.koreacentral-01.azurewebsites.net/login?redirect_target=${encodeURIComponent(target)}`;
+    window.location.href = loginUrl;
   };
 
   const markAiSpeaking = () => {
@@ -470,7 +486,7 @@ export default function Home() {
       if (inputContextRef.current) {
         try {
           await inputContextRef.current.close();
-        } catch {}
+        } catch { }
         inputContextRef.current = null;
       }
 
@@ -634,13 +650,12 @@ export default function Home() {
           <button
             onClick={toggleCamera}
             disabled={!isConnected}
-            className={`w-full py-3 rounded-lg text-base font-bold transition ${
-              !isConnected
-                ? "bg-gray-700 cursor-not-allowed"
-                : isCameraOn
+            className={`w-full py-3 rounded-lg text-base font-bold transition ${!isConnected
+              ? "bg-gray-700 cursor-not-allowed"
+              : isCameraOn
                 ? "bg-yellow-600 hover:bg-yellow-700"
                 : "bg-indigo-600 hover:bg-indigo-700"
-            }`}
+              }`}
           >
             <span className="inline-flex items-center gap-2 justify-center">
               {isCameraOn ? <CameraOff size={18} /> : <Camera size={18} />}
@@ -652,13 +667,12 @@ export default function Home() {
           <button
             onClick={toggleScreenShare}
             disabled={!isConnected}
-            className={`w-full py-3 rounded-lg text-base font-bold transition ${
-              !isConnected
-                ? "bg-gray-700 cursor-not-allowed"
-                : isScreenOn
+            className={`w-full py-3 rounded-lg text-base font-bold transition ${!isConnected
+              ? "bg-gray-700 cursor-not-allowed"
+              : isScreenOn
                 ? "bg-rose-600 hover:bg-rose-700"
                 : "bg-cyan-600 hover:bg-cyan-700"
-            }`}
+              }`}
           >
             <span className="inline-flex items-center gap-2 justify-center">
               {isScreenOn ? <MonitorOff size={18} /> : <Monitor size={18} />}
@@ -686,11 +700,15 @@ export default function Home() {
         {transcripts.length === 0 && <p className="text-gray-600 text-center text-sm py-10">대화 내용이 여기에 표시됩니다...</p>}
         {transcripts.map((msg, idx) => (
           <div key={idx} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
-            <div className={`max-w-[80%] rounded-2xl px-4 py-2 text-sm ${msg.role === "user"
-              ? "bg-blue-600 text-white rounded-br-none"
-              : "bg-gray-700 text-gray-200 rounded-bl-none"
+            <div className={`max-w-[80%] rounded-2xl px-4 py-2 text-sm border ${msg.role === "user"
+              ? "bg-blue-600 text-white border-blue-600 rounded-br-none"
+              : msg.role === "lumi"
+                ? "bg-blue-100 text-blue-900 border-blue-200 rounded-bl-none shadow-sm"
+                : msg.role === "rami"
+                  ? "bg-orange-100 text-orange-900 border-orange-200 rounded-bl-none shadow-sm"
+                  : "bg-gray-700 text-gray-200 border-gray-600 rounded-bl-none"
               }`}>
-              <p className="font-bold text-[10px] opacity-50 mb-1 uppercase">{msg.role}</p>
+              <p className="font-bold text-[10px] opacity-70 mb-1 uppercase">{msg.role}</p>
               {msg.text}
             </div>
           </div>

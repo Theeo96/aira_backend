@@ -81,10 +81,11 @@ def is_arrival_eta_query(text: str) -> bool:
     t = str(text or "").lower()
     if not t:
         return False
-    transit_tokens = ["지하철", "전철", "열차", "subway", "train"]
+    # Use exact same logic defined in AIRA_FIX_PLAN
+    transit_tokens = ["지하철", "전철", "열차", "subway", "train", "호선", "버스"]
     eta_tokens = [
-        "몇 분", "몇분", "언제 와", "언제와", "도착", "남았", "남았어",
-        "도착 예정", "도착예정", "다음 열차", "다음열차", "첫 열차", "첫열차",
+        "몇 분", "몇분", "언제 와", "언제와", "도착", "남았", "어디 쯤", "어디쯤", "어디야",
+        "도착 예정", "도착예정", "다음 열차", "다음열차", "첫 열차", "첫차", "막차"
     ]
     has_transit = any(k in t for k in transit_tokens)
     has_eta = any(k in t for k in eta_tokens)

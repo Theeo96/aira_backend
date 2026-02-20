@@ -61,7 +61,15 @@ class TransitRuntimeService:
             mm = int(m.group(1) or 0)
             ss = int(m.group(2) or 0)
             return self.round_eta_minutes(mm * 60 + ss)
+            
+        m2 = re.search(r"(\d+)[\s*]?(?:번째)?\s*전역", text)
+        if m2:
+            stations_away = int(m2.group(1))
+            return stations_away * 2
+
         if re.search(r"\uC804\uC5ED\s*\uB3C4\uCC29", text):
+            return 2
+        if re.search(r"\uACF3\s*\uB3C4\uCC29|\uC7A0\uC2DC\s*\uD6C4|\uC9C4\uC785|\uB3C4\uCC29", text):
             return 1
         if re.search(r"\uACF3\s*\uB3C4\uCC29|\uC7A0\uC2DC\s*\uD6C4|\uC9C4\uC785|\uB3C4\uCC29", text):
             return 0

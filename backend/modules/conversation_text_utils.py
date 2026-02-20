@@ -78,5 +78,9 @@ def is_home_update_utterance(text: str) -> bool:
         "집 도착역",
         "집 근처 역",
         "집이 ",
+        "내 집",
+        "내집",
+        "집 앞",
+        "집앞",
     ]
     return any(k in t for k in keywords)

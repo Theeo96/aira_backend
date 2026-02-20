@@ -45,3 +45,8 @@ Output/
 .gradio/
 *.pem
 backend/modules/gmail_alert_state.json
+
+reference_dual/
+integ_plans/
+backend/legacy/
+temp_front/legacy/
