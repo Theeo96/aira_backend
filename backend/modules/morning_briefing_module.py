@@ -1,10 +1,10 @@
-import json
+﻿import json
 import math
 import os
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -13,6 +13,8 @@ from dotenv import dotenv_values
 
 from .news_agent import NewsAgent
 from .tmap_service import TmapService
+
+KST = ZoneInfo("Asia/Seoul")
 
 
 def _to_float(value: Any) -> float | None:
@@ -63,16 +65,21 @@ class MorningBriefingModule:
         self.news_agent = news_agent
         self.tmap = TmapService(os.getenv("TMAP_APP_KEY"), log=log)
         self.odsay_key = str(os.getenv("ODSAY_API_KEY") or "").strip()
-        # backend/modules/morning_briefing_module.py -> project root
         self.project_root = Path(__file__).resolve().parents[2]
+
         raw_profile_path = os.getenv("BRIEFING_PROFILE_PATH", "backend/data/user_profile.json")
         raw_test_config_path = os.getenv("BRIEFING_TEST_CONFIG", "backend/data/test_config.json")
-        init_mode = str(os.getenv("BRIEFING_MODE", "live")).strip().lower()
         self.config = BriefingConfig(
             profile_path=str(self._resolve_path(raw_profile_path)),
             test_config_path=str(self._resolve_path(raw_test_config_path)),
-            test_mode=init_mode == "test",
+            test_mode=False,
         )
+
+    def _normalize_mode(self, raw_mode: Any, default: str = "live") -> str:
+        mode = str(raw_mode or "").strip().lower()
+        if mode in {"off", "live", "test"}:
+            return mode
+        return default
 
     def _read_dotenv_runtime(self) -> dict[str, str]:
         env_path = self.project_root / ".env"
@@ -83,34 +90,33 @@ class MorningBriefingModule:
             return {}
 
     def _get_runtime_env(self, key: str, default: str) -> str:
-        # Prefer current .env file value so runtime edits are reflected without restart.
         file_env = self._read_dotenv_runtime()
         if key in file_env:
             return str(file_env.get(key) or default)
         return str(os.getenv(key, default))
 
-    def _is_enabled(self, key: str, default: bool = False) -> bool:
-        raw = self._get_runtime_env(key, "true" if default else "false")
-        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
-
-    def _get_briefing_mode(self) -> str:
-        # Unified mode:
-        # - off: disable all briefing behavior
-        # - live: real data/profile based briefing
-        # - test: mock(test_config) based briefing
-        mode = str(self._get_runtime_env("BRIEFING_MODE", "")).strip().lower()
-        if mode in {"off", "live", "test"}:
-            return mode
-        # Backward compatibility when BRIEFING_MODE is not provided.
-        return "test" if self._is_enabled("BRIEFING_TEST_MODE", default=False) else "live"
+    def _get_phase_mode(self, phase: str) -> str:
+        phase_key_map = {
+            "wake_up": "BRIEFING_MODE_WAKE_UP",
+            "leave_home": "BRIEFING_MODE_LEAVE_HOME",
+            "leave_office": "BRIEFING_MODE_LEAVE_OFFICE",
+        }
+        env_key = phase_key_map.get(str(phase or "").strip())
+        if not env_key:
+            return "live"
+        return self._normalize_mode(self._get_runtime_env(env_key, "live"), default="live")
 
     def _refresh_runtime_config(self):
         raw_profile_path = self._get_runtime_env("BRIEFING_PROFILE_PATH", "backend/data/user_profile.json")
         raw_test_config_path = self._get_runtime_env("BRIEFING_TEST_CONFIG", "backend/data/test_config.json")
-        mode = self._get_briefing_mode()
+        modes = {
+            self._get_phase_mode("wake_up"),
+            self._get_phase_mode("leave_home"),
+            self._get_phase_mode("leave_office"),
+        }
         self.config.profile_path = str(self._resolve_path(raw_profile_path))
         self.config.test_config_path = str(self._resolve_path(raw_test_config_path))
-        self.config.test_mode = mode == "test"
+        self.config.test_mode = "test" in modes
 
     def _resolve_path(self, raw_path: str) -> Path:
         p = Path(str(raw_path or "").strip())
@@ -123,7 +129,7 @@ class MorningBriefingModule:
 
     def _load_json(self, path: str) -> dict[str, Any]:
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
             return data if isinstance(data, dict) else {}
         except Exception as e:
@@ -133,24 +139,47 @@ class MorningBriefingModule:
     def _resolve_context(self) -> tuple[dict[str, Any], dict[str, Any] | None]:
         self._refresh_runtime_config()
         profile = self._load_json(self.config.profile_path)
-        test_cfg = self._load_json(self.config.test_config_path) if self.config.test_mode else None
+        test_cfg = self._load_json(self.config.test_config_path)
         return profile, test_cfg
 
-    def is_test_mode(self) -> bool:
-        self._refresh_runtime_config()
-        return bool(self.config.test_mode)
+    def _section(self, test_cfg: dict[str, Any] | None, key: str) -> dict[str, Any]:
+        if not isinstance(test_cfg, dict):
+            return {}
+        v = test_cfg.get(key)
+        return v if isinstance(v, dict) else {}
 
-    def is_briefing_enabled(self) -> bool:
-        return self._get_briefing_mode() != "off"
+    def _parse_iso(self, value: Any, fallback: datetime) -> datetime:
+        text = str(value or "").strip()
+        if not text:
+            return fallback
+        try:
+            dt = datetime.fromisoformat(text.replace(" ", "T"))
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=KST)
+            return dt.astimezone(KST)
+        except Exception:
+            return fallback
 
-    def is_wake_up_enabled(self) -> bool:
-        return self.is_briefing_enabled()
+    def _coord(self, raw: dict[str, Any] | None) -> dict[str, float] | None:
+        if not isinstance(raw, dict):
+            return None
+        lat = _to_float(raw.get("lat"))
+        lng = _to_float(raw.get("lng"))
+        if lat is None or lng is None:
+            return None
+        return {"lat": float(lat), "lng": float(lng)}
 
-    def is_leaving_home_enabled(self) -> bool:
-        return self.is_briefing_enabled()
-
-    def is_briefing_api_enabled(self) -> bool:
-        return self.is_briefing_enabled()
+    def _weather_from_raw(self, raw: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            "temperature": _to_float(raw.get("temperature")),
+            "condition_code": _to_int(raw.get("condition_code")),
+            "precipitation_probability": _to_int(raw.get("precipitation_probability")),
+            "rain_mm": _to_float(raw.get("rain_mm")),
+            "today_max": _to_float(raw.get("today_max")),
+            "today_min": _to_float(raw.get("today_min")),
+        }
 
     def _fetch_weather(self, lat: float, lng: float) -> dict[str, Any]:
         url = (
@@ -182,8 +211,7 @@ class MorningBriefingModule:
             "today_max": _to_float(tmax_arr[0]) if tmax_arr else None,
             "today_min": _to_float(tmin_arr[0]) if tmin_arr else None,
         }
-
-    def _fetch_odsay_commute(self, origin: dict[str, float], destination: dict[str, float]) -> dict[str, Any]:
+    def _fetch_odsay_transit(self, origin: dict[str, float], destination: dict[str, float]) -> dict[str, Any]:
         if not self.odsay_key:
             return {}
         query = urllib.parse.urlencode(
@@ -212,68 +240,64 @@ class MorningBriefingModule:
         for seg in sub_path:
             if not isinstance(seg, dict):
                 continue
-            traffic_type = _to_int(seg.get("trafficType"))
-            if traffic_type in (1, 2):
-                first_mode = "subway" if traffic_type == 1 else "bus"
-                boarding_station = seg.get("startName")
+            t = _to_int(seg.get("trafficType"))
+            if t in (1, 2):
+                first_mode = "subway" if t == 1 else "bus"
+                boarding_station = str(seg.get("startName") or "").strip() or None
                 lane = seg.get("lane", [])
                 if isinstance(lane, list) and lane and isinstance(lane[0], dict):
-                    subway_line = lane[0].get("name")
+                    subway_line = str(lane[0].get("name") or "").strip() or None
                 break
         return {
             "estimated_minutes": _to_int(info.get("totalTime")),
+            "provider": "odsay",
             "first_mode": first_mode,
             "subway_line": subway_line,
             "boarding_station": boarding_station,
-            "provider": "odsay",
         }
 
-    def _fetch_commute_time(self, origin: dict[str, float], destination: dict[str, float]) -> dict[str, Any]:
-        def _normalize_minutes(raw: Any) -> int | None:
+    def _fetch_transit_time(self, origin: dict[str, float], destination: dict[str, float]) -> dict[str, Any]:
+        def _norm(raw: Any) -> int | None:
             m = _to_int(raw)
-            if m is None:
+            if m is None or m <= 0:
                 return None
-            if m <= 0:
-                return None
-            # In Tmap responses, totalTime can be returned in seconds.
-            # Treat very large values as seconds and convert to minutes.
-            if m > 240:
-                m = int(round(m / 60))
-            return m
+            return int(round(m / 60)) if m > 240 else m
 
         tmap_raw = self.tmap.get_transit_route(origin=origin, destination=destination)
-        tmap_minutes = None
         if isinstance(tmap_raw, dict):
-            mm = tmap_raw.get("metaData", {}) if isinstance(tmap_raw.get("metaData"), dict) else {}
-            plan = mm.get("plan", {}) if isinstance(mm.get("plan"), dict) else {}
+            meta = tmap_raw.get("metaData", {}) if isinstance(tmap_raw.get("metaData"), dict) else {}
+            plan = meta.get("plan", {}) if isinstance(meta.get("plan"), dict) else {}
             routes = plan.get("itineraries") if isinstance(plan.get("itineraries"), list) else []
             if routes and isinstance(routes[0], dict):
-                tmap_minutes = _normalize_minutes(routes[0].get("totalTime"))
-        if tmap_minutes is not None and 1 <= int(tmap_minutes) <= 240:
-            return {"estimated_minutes": tmap_minutes, "provider": "tmap", "first_mode": None, "subway_line": None, "boarding_station": None}
-        odsay = self._fetch_odsay_commute(origin=origin, destination=destination)
-        odsay_minutes = _normalize_minutes(odsay.get("estimated_minutes"))
-        if odsay_minutes is not None:
-            odsay["estimated_minutes"] = odsay_minutes
-        if odsay_minutes is not None and 1 <= int(odsay_minutes) <= 240:
+                m = _norm(routes[0].get("totalTime"))
+                if m is not None:
+                    return {"estimated_minutes": m, "provider": "tmap"}
+
+        odsay = self._fetch_odsay_transit(origin=origin, destination=destination)
+        m = _norm(odsay.get("estimated_minutes"))
+        if m is not None:
+            odsay["estimated_minutes"] = m
             return odsay
-        if tmap_minutes is not None:
-            fallback_minutes = min(max(int(tmap_minutes), 1), 240)
-            return {"estimated_minutes": fallback_minutes, "provider": "tmap", "first_mode": None, "subway_line": None, "boarding_station": None}
         return odsay
+
+    def _fetch_car_minutes(self, origin: dict[str, float], destination: dict[str, float]) -> int | None:
+        route = self.tmap.get_car_route(origin=origin, destination=destination)
+        if not isinstance(route, dict):
+            return None
+        features = route.get("features") if isinstance(route.get("features"), list) else []
+        if not features:
+            return None
+        props = features[0].get("properties") if isinstance(features[0], dict) and isinstance(features[0].get("properties"), dict) else {}
+        sec = _to_int(props.get("totalTime"))
+        if sec is not None and sec > 0:
+            return max(1, int(round(sec / 60)))
+        return _to_int(props.get("totalTimeMin"))
 
     def _extract_district(self, lat: float, lng: float) -> str:
         district = self.tmap.reverse_geocode_district(lat=lat, lng=lng)
-        if district:
-            return district
-        data = _http_get_json("http://ip-api.com/json/?fields=city")
-        if isinstance(data, dict):
-            city = str(data.get("city") or "").strip()
-            if city:
-                return city
-        return "서울"
+        return district if district else "서울"
 
-    def _fetch_news(self, keywords: list[str], max_count: int = 5) -> list[dict[str, Any]]:
+    def _fetch_news(self, keywords: list[str], max_count: int = 3) -> list[dict[str, Any]]:
         agent = self.news_agent or NewsAgent()
         items: list[dict[str, Any]] = []
         seen = set()
@@ -291,275 +315,410 @@ class MorningBriefingModule:
                     continue
                 if link:
                     seen.add(link)
-                items.append(
-                    {
-                        "title": str(n.get("title") or "").strip(),
-                        "link": link,
-                        "pubDate": str(n.get("pubDate") or "").strip(),
-                    }
-                )
+                items.append({"title": str(n.get("title") or "").strip(), "link": link, "pubDate": str(n.get("pubDate") or "").strip()})
         items.sort(key=lambda x: x.get("pubDate", ""), reverse=True)
         return items[:max_count]
 
-    def _news_summary(self, news: list[dict[str, Any]], max_lines: int = 3) -> str:
-        if not news:
-            return "뉴스를 불러오지 못했습니다."
-        lines = []
-        for i, n in enumerate(news[:max_lines], start=1):
-            title = str(n.get("title") or "").strip()
-            if title:
-                lines.append(f"{i}. {title}")
-        return " / ".join(lines) if lines else "뉴스를 불러오지 못했습니다."
+    def _fetch_events(self, district: str, max_count: int = 2) -> list[dict[str, Any]]:
+        key = str(os.getenv("SEOUL_API_KEY") or os.getenv("Seoul_API") or "").strip()
+        if not key:
+            return []
+        data = _http_get_json(f"http://openapi.seoul.go.kr:8088/{key}/json/culturalEventInfo/1/120/", timeout=6)
+        if not isinstance(data, dict):
+            return []
+        body = data.get("culturalEventInfo", {}) if isinstance(data.get("culturalEventInfo"), dict) else {}
+        rows = body.get("row") if isinstance(body.get("row"), list) else []
+        picked: list[dict[str, Any]] = []
+        k = str(district or "").replace(" ", "")
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            gu = str(row.get("GUNAME") or "").replace(" ", "")
+            if k and gu and (k not in gu and gu not in k):
+                continue
+            title = str(row.get("TITLE") or "").strip()
+            if not title:
+                continue
+            picked.append({"title": title, "date": str(row.get("DATE") or "").strip(), "place": str(row.get("PLACE") or "").strip()})
+            if len(picked) >= max_count:
+                break
+        return picked
 
-    def _clothing_advice(self, temperature: float | None) -> str:
-        if temperature is None:
-            return "가벼운 외투를 챙기세요."
-        if temperature <= 3:
-            return "두꺼운 코트와 목도리를 권장합니다."
-        if temperature <= 10:
-            return "가벼운 코트가 적당합니다."
-        if temperature <= 18:
-            return "얇은 겉옷을 챙기세요."
-        return "가벼운 차림이 좋습니다."
+    def normalize_transport_mode(self, mode: Any) -> str:
+        raw = str(mode or "").strip().lower()
+        if raw in {"car", "drive", "driving", "자가용", "자동차", "택시"}:
+            return "car"
+        if raw in {"public", "transit", "public_transit", "subway", "bus", "대중교통", "지하철", "버스"}:
+            return "public"
+        return "public"
 
-    def _compose_wake_up(
-        self,
-        weather: dict[str, Any],
-        commute: dict[str, Any],
-        news_summary: str,
-        district: str,
-        local_news: list[dict[str, Any]],
-        car_hint: str | None,
-        leave_early: str | None,
-    ) -> str:
-        t = weather.get("temperature")
-        pop = weather.get("precipitation_probability")
-        umbrella = bool(pop is not None and pop >= 50)
-        parts: list[str] = []
-        if t is not None:
-            parts.append(f"현재 기온은 {int(round(float(t)))}도입니다.")
-        if pop is not None:
-            parts.append(f"강수확률은 {int(pop)}%입니다.")
-        if umbrella:
-            parts.append("우산을 챙기세요.")
-        parts.append(self._clothing_advice(t))
-        eta = commute.get("estimated_minutes")
-        if eta is not None:
-            parts.append(f"예상 출근 소요 시간은 약 {int(eta)}분입니다.")
-        if leave_early:
-            parts.append(leave_early)
-        if car_hint:
-            parts.append(car_hint)
-        parts.append(f"주요 뉴스: {news_summary}")
-        if local_news:
-            title = str(local_news[0].get("title") or "").strip()
-            if title:
-                parts.append(f"{district} 지역 소식: {title}")
-        # Keep proactive wake-up speech short to avoid audio cut-off.
-        compact = [p for p in parts if p][:6]
-        text = " ".join(compact).strip()
-        if len(text) > 320:
-            text = text[:317].rstrip() + "..."
-        return text
-
-    def _compose_leaving(
-        self,
-        destination_weather: dict[str, Any],
-        incidents: list[dict[str, Any]],
-        poi_congestion_label: str | None,
-        alt_route_minutes: int | None,
-        district: str,
-        local_news: list[dict[str, Any]],
-    ) -> str:
-        parts = []
-        t = destination_weather.get("temperature")
-        pop = destination_weather.get("precipitation_probability")
-        if t is not None:
-            parts.append(f"도착지 예상 기온은 {int(round(float(t)))}도입니다.")
-        if pop is not None:
-            parts.append(f"도착지 강수확률은 {int(pop)}%입니다.")
-        if incidents:
-            parts.append(f"경로상 특이사항 {len(incidents)}건이 있습니다.")
-        if poi_congestion_label:
-            parts.append(f"목적지 주변 혼잡도는 {poi_congestion_label}입니다.")
-        if alt_route_minutes is not None:
-            parts.append(f"대체 차량 경로는 약 {alt_route_minutes}분입니다.")
-        if local_news:
-            title = str(local_news[0].get("title") or "").strip()
-            if title:
-                parts.append(f"{district} 지역 이슈: {title}")
-        return " ".join([p for p in parts if p]).strip()
-
-    def _parse_poi_congestion_label(self, poi_data: dict[str, Any] | None) -> str | None:
-        if not isinstance(poi_data, dict):
-            return None
-        for key in ("congestionLabel", "label", "congestion", "level"):
-            v = str(poi_data.get(key) or "").strip()
-            if v:
-                return v
+    def detect_transport_choice(self, text: str) -> str | None:
+        t = str(text or "")
+        low = t.lower()
+        if "car" in low or "drive" in low or any(k in t for k in ["자가용", "자동차", "택시", "운전"]):
+            return "car"
+        if "public" in low or "transit" in low or any(k in t for k in ["대중교통", "지하철", "버스"]):
+            return "public"
         return None
 
-    def _parse_car_route_minutes(self, route_data: dict[str, Any] | None) -> int | None:
-        if not isinstance(route_data, dict):
-            return None
-        features = route_data.get("features") if isinstance(route_data.get("features"), list) else []
-        if not features:
-            return None
-        prop = features[0].get("properties") if isinstance(features[0], dict) and isinstance(features[0].get("properties"), dict) else {}
-        sec = _to_int(prop.get("totalTime"))
-        if sec is not None:
-            return max(1, int(round(sec / 60)))
-        minutes = _to_int(prop.get("totalTimeMin"))
-        return minutes
+    def get_transport_prompt_choices(self) -> list[str]:
+        return ["대중교통", "자가용"]
 
-    def build_wake_up_briefing(self) -> dict[str, Any]:
+    def get_default_transport_mode(self) -> str:
         profile, test_cfg = self._resolve_context()
-        now = datetime.now(ZoneInfo("Asia/Seoul"))
-        home = profile.get("home", {}) if isinstance(profile.get("home"), dict) else {}
-        office = profile.get("office", {}) if isinstance(profile.get("office"), dict) else {}
-        if isinstance(test_cfg, dict):
-            if isinstance(test_cfg.get("mock_home"), dict):
-                home = test_cfg.get("mock_home")
-            if isinstance(test_cfg.get("mock_office"), dict):
-                office = test_cfg.get("mock_office")
-            mock_time = str(test_cfg.get("mock_time") or "").strip()
-            if mock_time:
-                try:
-                    now = datetime.fromisoformat(mock_time.replace(" ", "T"))
-                except Exception:
-                    pass
-        home_lat = _to_float(home.get("lat"))
-        home_lng = _to_float(home.get("lng"))
-        office_lat = _to_float(office.get("lat"))
-        office_lng = _to_float(office.get("lng"))
-        if home_lat is None or home_lng is None or office_lat is None or office_lng is None:
-            return {"ok": False, "error": "home/office 좌표가 필요합니다."}
+        mode = self.normalize_transport_mode(profile.get("default_transport_mode"))
+        if self._get_phase_mode("wake_up") == "test":
+            wake = self._section(test_cfg, "wake_up")
+            mode = self.normalize_transport_mode(wake.get("recommended_transport") or mode)
+        return mode
 
-        weather = {}
-        if isinstance(test_cfg, dict) and isinstance(test_cfg.get("mock_weather"), dict):
-            weather = test_cfg.get("mock_weather")
+    def should_auto_wake_up_in_test(self) -> bool:
+        if self._get_phase_mode("wake_up") != "test":
+            return False
+        _, test_cfg = self._resolve_context()
+        ctrl = self._section(test_cfg, "test_control")
+        return bool(ctrl.get("auto_wake_up"))
+
+    def is_test_mode(self) -> bool:
+        self._refresh_runtime_config()
+        return bool(
+            self._get_phase_mode("wake_up") == "test"
+            or self._get_phase_mode("leave_home") == "test"
+            or self._get_phase_mode("leave_office") == "test"
+        )
+
+    def is_wake_up_test_mode(self) -> bool:
+        return self._get_phase_mode("wake_up") == "test"
+
+    def is_leaving_home_test_mode(self) -> bool:
+        return self._get_phase_mode("leave_home") == "test"
+
+    def is_leaving_office_test_mode(self) -> bool:
+        return self._get_phase_mode("leave_office") == "test"
+
+    def is_briefing_enabled(self) -> bool:
+        return (
+            self._get_phase_mode("wake_up") != "off"
+            or self._get_phase_mode("leave_home") != "off"
+            or self._get_phase_mode("leave_office") != "off"
+        )
+
+    def is_wake_up_enabled(self) -> bool:
+        return self._get_phase_mode("wake_up") != "off"
+
+    def is_leaving_home_enabled(self) -> bool:
+        return self._get_phase_mode("leave_home") != "off"
+
+    def is_leaving_office_enabled(self) -> bool:
+        return self._get_phase_mode("leave_office") != "off"
+
+    def is_briefing_api_enabled(self) -> bool:
+        return self.is_briefing_enabled()
+
+    def get_briefing_mode(self) -> str:
+        modes = {
+            self._get_phase_mode("wake_up"),
+            self._get_phase_mode("leave_home"),
+            self._get_phase_mode("leave_office"),
+        }
+        return list(modes)[0] if len(modes) == 1 else "mixed"
+
+    def get_wake_up_time(self) -> str:
+        profile, test_cfg = self._resolve_context()
+        wake = self._section(test_cfg, "wake_up") if self._get_phase_mode("wake_up") == "test" else {}
+        val = str(wake.get("alarm_time") or profile.get("wake_up_time") or "07:00").strip()
+        return val if val else "07:00"
+
+    def get_evening_trigger_window(self) -> tuple[int, int]:
+        profile, test_cfg = self._resolve_context()
+        sec = self._section(test_cfg, "leave_office") if self._get_phase_mode("leave_office") == "test" else {}
+        start = _to_int(sec.get("window_start_hour")) or _to_int(profile.get("leave_office_window_start_hour")) or 18
+        end = _to_int(sec.get("window_end_hour")) or _to_int(profile.get("leave_office_window_end_hour")) or 19
+        return (start, end) if start <= end else (end, start)
+
+    def _clothing_tip(self, temp: float | None, pop: int | None) -> str:
+        tips = []
+        if temp is None:
+            tips.append("가벼운 겉옷을 챙기세요.")
+        elif temp <= 3:
+            tips.append("두꺼운 코트와 목도리를 추천해요.")
+        elif temp <= 10:
+            tips.append("코트나 자켓이 적당해요.")
+        elif temp <= 18:
+            tips.append("얇은 겉옷을 챙기면 좋아요.")
+        else:
+            tips.append("가벼운 차림이 좋아요.")
+        if pop is not None and pop >= 50:
+            tips.append("우산을 챙기세요.")
+        return " ".join(tips)
+    def build_wake_up_briefing(self) -> dict[str, Any]:
+        phase_mode = self._get_phase_mode("wake_up")
+        if phase_mode == "off":
+            return {"ok": True, "phase": "wake_up", "triggered": False, "reason": "mode_off"}
+        profile, test_cfg = self._resolve_context()
+        sec = self._section(test_cfg, "wake_up") if phase_mode == "test" else {}
+        now = self._parse_iso(sec.get("mock_now"), datetime.now(KST)) if sec else datetime.now(KST)
+
+        home = self._coord(sec.get("home")) if sec else None
+        office = self._coord(sec.get("office")) if sec else None
+        home = home or self._coord(profile.get("home"))
+        office = office or self._coord(profile.get("office"))
+        if not home or not office:
+            return {"ok": False, "error": "home/office coordinates are required"}
+
+        weather = self._weather_from_raw(sec.get("weather")) if sec else {}
         if not weather:
-            weather = self._fetch_weather(home_lat, home_lng)
+            weather = self._fetch_weather(home["lat"], home["lng"])
 
-        commute = self._fetch_commute_time(
-            origin={"lat": home_lat, "lng": home_lng},
-            destination={"lat": office_lat, "lng": office_lng},
-        )
-        usual = _to_int(profile.get("usual_commute_minutes")) or 40
-        estimated = _to_int(commute.get("estimated_minutes"))
-        if estimated is not None and estimated > (usual * 3):
-            # Safety-net for unexpected second/minute unit drift.
-            sec_to_min = int(round(estimated / 60))
-            if 1 <= sec_to_min <= 240:
-                estimated = sec_to_min
-                commute["estimated_minutes"] = estimated
-        leave_early = None
-        if estimated is not None and estimated - usual > 5:
-            leave_early = f"평소보다 {estimated - usual}분 일찍 출발하는 것을 권장합니다."
+        transit = sec.get("transit_info") if isinstance(sec.get("transit_info"), dict) else {}
+        if not transit:
+            transit = self._fetch_transit_time(home, office)
+        car_minutes = _to_int((sec.get("car_info") or {}).get("estimated_minutes")) if sec else None
+        if car_minutes is None:
+            car_minutes = self._fetch_car_minutes(home, office)
 
-        car_hint = None
-        if str(commute.get("first_mode") or "") == "subway":
-            line = str(commute.get("subway_line") or "").strip()
-            station = str(commute.get("boarding_station") or "").strip()
-            if line and station:
-                cong = self.tmap.get_subway_car_congestion(
-                    route_name=line,
-                    station_name=station,
-                    dow=now.weekday() + 1,
-                    hh=now.hour,
-                )
-                if isinstance(cong, dict):
-                    car_hint = "지하철 칸별 혼잡도 정보가 확인되어 덜 붐비는 칸 탑승을 권장합니다."
+        transit_minutes = _to_int(transit.get("estimated_minutes"))
+        recommended = self.normalize_transport_mode(sec.get("recommended_transport") if sec else None)
+        reason = ""
+        if sec and str(sec.get("recommendation_reason") or "").strip():
+            reason = str(sec.get("recommendation_reason")).strip()
+        else:
+            if transit_minutes is None and car_minutes is None:
+                recommended, reason = "public", "현재 교통 데이터가 제한적이라 우선 대중교통 기준으로 안내할게요."
+            elif transit_minutes is None:
+                recommended, reason = "car", f"자가용이 약 {car_minutes}분으로 예상돼요."
+            elif car_minutes is None:
+                recommended, reason = "public", f"대중교통이 약 {transit_minutes}분으로 예상돼요."
+            elif transit_minutes <= car_minutes - 5:
+                recommended, reason = "public", f"대중교통 {transit_minutes}분, 자가용 {car_minutes}분으로 대중교통이 더 빨라요."
+            elif car_minutes <= transit_minutes - 5:
+                recommended, reason = "car", f"자가용 {car_minutes}분, 대중교통 {transit_minutes}분으로 자가용이 더 빨라요."
+            else:
+                recommended, reason = "public", "두 수단이 비슷하지만 혼잡 리스크를 고려해 대중교통을 추천해요."
 
-        interests = profile.get("interest_keywords") if isinstance(profile.get("interest_keywords"), list) else []
-        interests = [str(x) for x in interests if str(x).strip()] or ["AI", "경제", "서울"]
-        news = self._fetch_news(interests, max_count=5)
-        news_summary = self._news_summary(news)
+        temp = _to_float(weather.get("temperature"))
+        pop = _to_int(weather.get("precipitation_probability"))
+        parts = ["좋은 아침이에요."]
+        if temp is not None:
+            parts.append(f"현재 기온은 {int(round(temp))}도입니다.")
+        if pop is not None:
+            parts.append(f"강수확률은 {pop}%입니다.")
+        parts.append(self._clothing_tip(temp, pop))
+        if transit_minutes is not None:
+            parts.append(f"출근 예상 시간은 대중교통 약 {transit_minutes}분입니다.")
+        if car_minutes is not None:
+            parts.append(f"자가용은 약 {car_minutes}분입니다.")
+        if reason:
+            parts.append(reason)
+        parts.append("오늘 이동수단은 대중교통과 자가용 중 무엇으로 안내할까요?")
 
-        district = self._extract_district(home_lat, home_lng)
-        local_news = self._fetch_news([district], max_count=2)
-        briefing_text = self._compose_wake_up(
-            weather=weather,
-            commute=commute,
-            news_summary=news_summary,
-            district=district,
-            local_news=local_news,
-            car_hint=car_hint,
-            leave_early=leave_early,
-        )
+        interest_news = [x for x in (sec.get("interest_news") if isinstance(sec.get("interest_news"), list) else []) if isinstance(x, dict)] if sec else []
+        if not interest_news:
+            kws = profile.get("interest_keywords") if isinstance(profile.get("interest_keywords"), list) else []
+            keywords = [str(x).strip() for x in kws if str(x).strip()] or ["AI", "경제", "서울"]
+            interest_news = self._fetch_news(keywords, max_count=3)
+
+        district = str(sec.get("home_district") or "").strip() if sec else ""
+        if not district:
+            district = self._extract_district(home["lat"], home["lng"])
+        events = [x for x in (sec.get("local_events") if isinstance(sec.get("local_events"), list) else []) if isinstance(x, dict)] if sec else []
+        local_news = [x for x in (sec.get("local_news") if isinstance(sec.get("local_news"), list) else []) if isinstance(x, dict)] if sec else []
+        if not events:
+            events = self._fetch_events(district, max_count=2)
+        if not local_news:
+            local_news = self._fetch_news([district], max_count=2)
+
         return {
             "ok": True,
             "phase": "wake_up",
-            "briefing": briefing_text,
+            "triggered": True,
+            "trigger_time": now.isoformat(),
+            "briefing": " ".join([p for p in parts if p]).strip(),
             "weather": weather,
-            "commute": commute,
-            "district": district,
-            "news": news,
-            "local_news": local_news,
-            "test_mode": self.config.test_mode,
+            "commute_public": transit,
+            "commute_car": {"estimated_minutes": car_minutes, "provider": "tmap" if car_minutes else None},
+            "recommended_transport": recommended,
+            "ask_transport_choice": True,
+            "transport_choices": self.get_transport_prompt_choices(),
+            "interest_news": interest_news,
+            "local_issue": {"events": events, "local_news": local_news},
+            "home_district": district,
+            "test_mode": phase_mode == "test",
         }
+    def build_commute_briefing(
+        self,
+        trigger_type: str,
+        current_gps: dict[str, float] | None,
+        selected_transport: str | None = None,
+        moved_m: float | None = None,
+    ) -> dict[str, Any]:
+        if trigger_type not in {"leave_home", "leave_office"}:
+            return {"ok": False, "error": "invalid trigger_type"}
 
-    def get_wake_up_time(self) -> str:
-        profile, _ = self._resolve_context()
-        wake_up_time = str(profile.get("wake_up_time") or "").strip()
-        if not wake_up_time:
-            return "07:00"
-        return wake_up_time
+        phase_key = "leave_home" if trigger_type == "leave_home" else "leave_office"
+        mode = self._get_phase_mode(phase_key)
+        if mode == "off":
+            return {"ok": True, "triggered": False, "phase": trigger_type, "reason": "mode_off"}
 
-    def build_leaving_home_alert(self, current_gps: dict[str, float] | None = None) -> dict[str, Any]:
         profile, test_cfg = self._resolve_context()
-        home = profile.get("home", {}) if isinstance(profile.get("home"), dict) else {}
-        office = profile.get("office", {}) if isinstance(profile.get("office"), dict) else {}
-        if isinstance(test_cfg, dict):
-            if isinstance(test_cfg.get("mock_office"), dict):
-                office = test_cfg.get("mock_office")
-            if isinstance(test_cfg.get("mock_home"), dict):
-                home = test_cfg.get("mock_home")
-            if isinstance(test_cfg.get("mock_location"), dict):
-                current_gps = test_cfg.get("mock_location")
+        sec = self._section(test_cfg, phase_key) if mode == "test" else {}
+        now = self._parse_iso(sec.get("mock_now"), datetime.now(KST)) if sec else datetime.now(KST)
+
+        home = self._coord(sec.get("home")) if sec else None
+        office = self._coord(sec.get("office")) if sec else None
+        home = home or self._coord(profile.get("home"))
+        office = office or self._coord(profile.get("office"))
+        if not home or not office:
+            return {"ok": False, "error": "home/office coordinates are required", "phase": trigger_type}
+
         if not isinstance(current_gps, dict):
-            return {"ok": False, "error": "current_gps 값이 필요합니다."}
+            if sec and isinstance(sec.get("current_gps"), dict):
+                current_gps = sec.get("current_gps")
+            else:
+                return {"ok": False, "error": "current_gps is required", "phase": trigger_type}
 
-        home_point = {"lat": _to_float(home.get("lat")), "lng": _to_float(home.get("lng"))}
-        cur_point = {"lat": _to_float(current_gps.get("lat")), "lng": _to_float(current_gps.get("lng"))}
-        office_point = {"lat": _to_float(office.get("lat")), "lng": _to_float(office.get("lng"))}
-        if None in {home_point["lat"], home_point["lng"], cur_point["lat"], cur_point["lng"], office_point["lat"], office_point["lng"]}:
-            return {"ok": False, "error": "좌표 정보가 누락되었습니다."}
+        current = self._coord(current_gps)
+        if not current:
+            return {"ok": False, "error": "invalid current_gps", "phase": trigger_type}
 
-        distance_m = _haversine_meters(cur_point, home_point)
+        anchor = home if trigger_type == "leave_home" else office
+        destination = office if trigger_type == "leave_home" else home
+        distance_m = _to_float(sec.get("distance_from_anchor_m")) if sec else None
+        if distance_m is None:
+            distance_m = _haversine_meters(current, anchor)
         if distance_m < 50:
-            return {"ok": True, "phase": "leaving_home", "alert": "", "triggered": False, "distance_m": int(distance_m)}
+            return {"ok": True, "triggered": False, "phase": trigger_type, "distance_m": int(distance_m), "reason": "within_anchor_radius"}
 
-        destination_weather = self._fetch_weather(office_point["lat"], office_point["lng"])
-        incidents = []
-        if isinstance(test_cfg, dict) and isinstance(test_cfg.get("mock_incidents"), list):
-            incidents = [x for x in test_cfg.get("mock_incidents") if isinstance(x, dict)]
+        if trigger_type == "leave_office":
+            start_h, end_h = self.get_evening_trigger_window()
+            if mode == "live" and not (start_h <= now.hour <= end_h):
+                return {"ok": True, "triggered": False, "phase": trigger_type, "reason": "outside_evening_window"}
+            if mode == "live" and moved_m is not None and float(moved_m) < 50.0:
+                return {"ok": True, "triggered": False, "phase": trigger_type, "reason": "movement_too_small", "moved_m": float(moved_m)}
 
-        poi = self.tmap.get_poi_congestion(lat=office_point["lat"], lng=office_point["lng"])
-        poi_label = self._parse_poi_congestion_label(poi)
-        alt_route = self.tmap.get_car_route(origin=cur_point, destination=office_point) if incidents else None
-        alt_route_minutes = self._parse_car_route_minutes(alt_route)
-        district = self._extract_district(cur_point["lat"], cur_point["lng"])
-        local_news = self._fetch_news([district], max_count=2)
-        alert = self._compose_leaving(
-            destination_weather=destination_weather,
-            incidents=incidents,
-            poi_congestion_label=poi_label,
-            alt_route_minutes=alt_route_minutes,
-            district=district,
-            local_news=local_news,
-        )
+        transport = self.normalize_transport_mode(selected_transport or sec.get("selected_transport") or profile.get("default_transport_mode"))
+
+        transit_info = sec.get("transit_info") if isinstance(sec.get("transit_info"), dict) else {}
+        car_info = sec.get("car_info") if isinstance(sec.get("car_info"), dict) else {}
+        if transport == "car":
+            commute = {"estimated_minutes": _to_int(car_info.get("estimated_minutes")), "provider": str(car_info.get("provider") or "mock"), "traffic_note": str(car_info.get("traffic_note") or "").strip()}
+            if commute.get("estimated_minutes") is None:
+                commute = {"estimated_minutes": self._fetch_car_minutes(current, destination), "provider": "tmap", "traffic_note": ""}
+        else:
+            commute = {
+                "estimated_minutes": _to_int(transit_info.get("estimated_minutes")),
+                "provider": str(transit_info.get("provider") or "mock"),
+                "first_mode": str(transit_info.get("first_mode") or "").strip() or None,
+                "subway_line": str(transit_info.get("subway_line") or "").strip() or None,
+                "boarding_station": str(transit_info.get("boarding_station") or "").strip() or None,
+                "arrival_info": str(transit_info.get("arrival_info") or "").strip(),
+            }
+            if commute.get("estimated_minutes") is None:
+                commute = self._fetch_transit_time(current, destination)
+
+        destination_weather = self._weather_from_raw(sec.get("destination_weather")) if sec else {}
+        if not destination_weather:
+            destination_weather = self._fetch_weather(destination["lat"], destination["lng"])
+
+        incidents = [x for x in (sec.get("traffic_incidents") if isinstance(sec.get("traffic_incidents"), list) else []) if isinstance(x, dict)] if sec else []
+        poi_data = sec.get("poi_congestion") if isinstance(sec.get("poi_congestion"), dict) else None
+        if not poi_data:
+            poi_data = self.tmap.get_poi_congestion(lat=destination["lat"], lng=destination["lng"])
+        poi_label = None
+        if isinstance(poi_data, dict):
+            for k in ("congestionLabel", "label", "congestion", "level"):
+                v = str(poi_data.get(k) or "").strip()
+                if v:
+                    poi_label = v
+                    break
+
+        district = str(sec.get("local_district") or "").strip() if sec else ""
+        if not district:
+            p = current if trigger_type == "leave_home" else anchor
+            district = self._extract_district(p["lat"], p["lng"])
+
+        interest_news = [x for x in (sec.get("interest_news") if isinstance(sec.get("interest_news"), list) else []) if isinstance(x, dict)] if sec else []
+        if not interest_news:
+            kws = profile.get("interest_keywords") if isinstance(profile.get("interest_keywords"), list) else []
+            keywords = [str(x).strip() for x in kws if str(x).strip()] or ["AI", "경제", "서울"]
+            interest_news = self._fetch_news(keywords, max_count=3)
+
+        events = [x for x in (sec.get("local_events") if isinstance(sec.get("local_events"), list) else []) if isinstance(x, dict)] if sec else []
+        local_news = [x for x in (sec.get("local_news") if isinstance(sec.get("local_news"), list) else []) if isinstance(x, dict)] if sec else []
+        if not events:
+            events = self._fetch_events(district, max_count=2)
+        if not local_news:
+            local_news = self._fetch_news([district], max_count=2)
+
+        eta = _to_int(commute.get("estimated_minutes"))
+        parts = ["출근 확인: 이동 시작을 확인했어요." if trigger_type == "leave_home" else "퇴근 확인: 이동 시작을 확인했어요."]
+        if eta is not None:
+            parts.append(f"{'대중교통' if transport == 'public' else '자가용'} 기준 예상 소요시간은 약 {eta}분입니다.")
+        if transport == "public":
+            line = str(commute.get("subway_line") or "").strip()
+            station = str(commute.get("boarding_station") or "").strip()
+            if line and station:
+                parts.append(f"{station}역에서 {line} 탑승 기준으로 안내합니다.")
+            if str(commute.get("arrival_info") or "").strip():
+                parts.append(str(commute.get("arrival_info")).strip())
+        elif str(commute.get("traffic_note") or "").strip():
+            parts.append(str(commute.get("traffic_note")).strip())
+
+        temp = _to_float(destination_weather.get("temperature"))
+        pop = _to_int(destination_weather.get("precipitation_probability"))
+        if temp is not None:
+            parts.append(f"도착지 기온은 약 {int(round(temp))}도입니다.")
+        if pop is not None:
+            parts.append(f"도착지 강수확률은 {pop}%입니다.")
+
+        if incidents:
+            s = str(incidents[0].get("summary") or incidents[0].get("title") or "").strip()
+            if s:
+                parts.append(f"교통 이슈: {s}")
+        if poi_label:
+            parts.append(f"도착지 주변 혼잡도는 {poi_label}입니다.")
+
+        if trigger_type == "leave_home" and interest_news:
+            n = str(interest_news[0].get("title") or "").strip()
+            if n:
+                parts.append(f"관심 뉴스: {n}")
+
+        if events:
+            e = events[0]
+            t = str(e.get("title") or "").strip()
+            p = str(e.get("place") or "").strip()
+            if t:
+                parts.append(f"지역 문화행사: {t}{f' ({p})' if p else ''}")
+        elif local_news:
+            n = str(local_news[0].get("title") or "").strip()
+            if n:
+                parts.append(f"지역 소식: {n}")
+
         return {
             "ok": True,
-            "phase": "leaving_home",
             "triggered": True,
+            "phase": trigger_type,
+            "trigger_time": now.isoformat(),
             "distance_m": int(distance_m),
-            "alert": alert,
+            "selected_transport": transport,
+            "alert": " ".join([p for p in parts if p]).strip(),
+            "commute": commute,
             "destination_weather": destination_weather,
-            "incidents": incidents,
-            "poi_congestion": poi,
-            "alternate_route": alt_route,
+            "traffic_incidents": incidents,
+            "poi_congestion": poi_data,
             "district": district,
-            "local_news": local_news,
-            "test_mode": self.config.test_mode,
+            "interest_news": interest_news,
+            "local_issue": {"events": events, "local_news": local_news},
+            "test_mode": mode == "test",
         }
+
+    def build_leaving_home_alert(self, current_gps: dict[str, float] | None = None, selected_transport: str | None = None) -> dict[str, Any]:
+        return self.build_commute_briefing("leave_home", current_gps, selected_transport, None)
+
+    def build_evening_local_alert(
+        self,
+        current_gps: dict[str, float] | None,
+        moved_m: float | None = None,
+        selected_transport: str | None = None,
+    ) -> dict[str, Any]:
+        return self.build_commute_briefing("leave_office", current_gps, selected_transport, moved_m)

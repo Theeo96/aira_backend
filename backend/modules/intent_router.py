@@ -96,6 +96,10 @@ class IntentRouter:
             return {"intent": "weather", "destination": self.destination_extractor(t), "source": "fallback", "home_update": False, "timer_seconds": None}
         if any(k in t for k in ["대기질", "미세먼지", "aqi"]):
             return {"intent": "air_quality", "destination": self.destination_extractor(t), "source": "fallback", "home_update": False, "timer_seconds": None}
+        if any(k in t.lower() for k in ["restaurant", "food", "lunch", "dinner"]) or any(
+            k in t for k in ["맛집", "음식점", "식당", "밥집", "먹을", "먹을만한", "추천해줘"]
+        ):
+            return {"intent": "restaurant", "destination": None, "source": "fallback", "home_update": False, "timer_seconds": None}
         return {"intent": "commute_overview", "destination": self.destination_extractor(t), "source": "fallback", "home_update": False, "timer_seconds": None}
 
     def route(self, text: str, active_timer: bool = False):
@@ -106,7 +110,7 @@ class IntentRouter:
             "Classify Korean commuter query intent. Return JSON only with keys: "
             "intent, destination, home_update, timer_seconds. "
             "intent must be one of "
-            "[subway_route,bus_route,weather,air_quality,news,commute_overview,general,timer,timer_cancel]. "
+            "[subway_route,bus_route,weather,air_quality,restaurant,news,commute_overview,general,timer,timer_cancel]. "
             "destination should be a concise place/station name or null. "
             "For timer intent, set destination=null and timer_seconds as integer seconds from now. "
             "For timer_cancel intent, set destination=null and timer_seconds=null. "
@@ -140,7 +144,7 @@ class IntentRouter:
                 except Exception:
                     timer_seconds = None
 
-            if intent not in {"subway_route", "bus_route", "weather", "air_quality", "news", "commute_overview", "general", "timer", "timer_cancel"}:
+            if intent not in {"subway_route", "bus_route", "weather", "air_quality", "restaurant", "news", "commute_overview", "general", "timer", "timer_cancel"}:
                 return self._fallback(text, active_timer=active_timer)
 
             if intent == "timer" and (timer_seconds is None or timer_seconds < 5 or timer_seconds > 21600):

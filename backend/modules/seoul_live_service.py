@@ -1,4 +1,5 @@
-﻿import time
+import math
+import time
 from typing import Callable, Optional
 
 
@@ -15,6 +16,7 @@ class SeoulLiveService:
         extract_news_topic: Optional[Callable[[str], str | None]] = None,
         get_news_headlines: Optional[Callable[[str | None, int], list]] = None,
         get_news_items: Optional[Callable[[str | None, int], list]] = None,
+        search_restaurants: Optional[Callable[[float, float, str, int], list]] = None,
     ):
         self.default_destination = default_destination
         self.normalize_place_name = normalize_place_name
@@ -26,6 +28,7 @@ class SeoulLiveService:
         self.extract_news_topic = extract_news_topic
         self.get_news_headlines = get_news_headlines
         self.get_news_items = get_news_items
+        self.search_restaurants = search_restaurants
 
     def execute_tools_for_intent(
         self,
@@ -81,6 +84,81 @@ class SeoulLiveService:
                 "homeConfigured": False,
                 "destinationName": destination_name,
                 "destinationRequested": bool(destination_name),
+            }
+
+        if intent == "restaurant":
+            if lat is None or lng is None:
+                return {
+                    "speechSummary": "현재 위치 정보가 없어 음식점 추천을 할 수 없습니다.",
+                    "restaurants": [],
+                }
+
+            keyword = str(user_text or "").strip() or "맛집"
+            norm_kw = "".join(keyword.lower().split())
+
+            def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+                r = 6371000.0
+                p1, p2 = math.radians(lat1), math.radians(lat2)
+                dp = math.radians(lat2 - lat1)
+                dl = math.radians(lon2 - lon1)
+                a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+                return r * (2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
+
+            cache_bucket = env_cache if isinstance(env_cache, dict) else {}
+            cache_obj = cache_bucket.get("restaurant") if isinstance(cache_bucket.get("restaurant"), dict) else {}
+            cache_rows = cache_obj.get("items") if isinstance(cache_obj.get("items"), list) else []
+            cache_kw = str(cache_obj.get("keyword") or "")
+            cache_ts = float(cache_obj.get("ts") or 0.0)
+            cache_lat = cache_obj.get("lat")
+            cache_lng = cache_obj.get("lng")
+            cache_ttl_sec = 10 * 60
+            use_cache = False
+            if cache_rows and cache_kw == norm_kw and cache_lat is not None and cache_lng is not None:
+                moved_m = _haversine_m(float(lat), float(lng), float(cache_lat), float(cache_lng))
+                use_cache = moved_m <= 250 and (time.monotonic() - cache_ts) <= cache_ttl_sec
+
+            restaurants = []
+            if use_cache:
+                restaurants = [x for x in cache_rows if isinstance(x, dict)]
+            elif self.search_restaurants:
+                restaurants = self.search_restaurants(lat, lng, keyword, 5) or []
+                if isinstance(cache_bucket, dict):
+                    cache_bucket["restaurant"] = {
+                        "lat": float(lat),
+                        "lng": float(lng),
+                        "keyword": norm_kw,
+                        "items": [x for x in restaurants if isinstance(x, dict)],
+                        "ts": time.monotonic(),
+                    }
+
+            top = [r for r in restaurants if isinstance(r, dict)][:3]
+            if not top:
+                return {
+                    "speechSummary": "현재 위치 기준 음식점 정보를 가져오지 못했습니다.",
+                    "restaurants": [],
+                }
+
+            lines = []
+            for i, r in enumerate(top, start=1):
+                name = str(r.get("name") or "").strip()
+                cat = str(r.get("category") or "").strip()
+                dist = r.get("distance_m")
+                extras = []
+                if cat:
+                    extras.append(cat)
+                if isinstance(dist, (int, float)):
+                    extras.append(f"{int(dist)}m")
+                suffix = f" ({', '.join(extras)})" if extras else ""
+                if name:
+                    lines.append(f"{i}. {name}{suffix}")
+            if not lines:
+                return {
+                    "speechSummary": "현재 위치 기준 음식점 정보를 가져오지 못했습니다.",
+                    "restaurants": [],
+                }
+            return {
+                "speechSummary": "현재 위치 기준 추천 음식점입니다. " + " / ".join(lines),
+                "restaurants": top,
             }
 
         if intent in {"weather", "air_quality"}:
@@ -178,6 +256,7 @@ class SeoulLiveService:
             destination_name=destination_name,
             prefer_subway=prefer_subway,
             detailed_subway=detailed_subway,
+            user_text=user_text,
         )
         if not isinstance(live, dict):
             return None

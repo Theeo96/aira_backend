@@ -5,22 +5,17 @@ load_dotenv()
 
 import asyncio
 import json
-import math
 import numpy as np
 import re
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from fastapi import Body, FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from google import genai
-import azure.cognitiveservices.speech as speechsdk
 import sys
-import urllib.parse
-import urllib.request
-import urllib.error
 from modules.cosmos_db import cosmos_service
 from modules.memory import memory_service
 from modules.seoul_info_module import build_seoul_info_packet, build_speech_summary
@@ -33,6 +28,18 @@ from modules.timer_service import TimerService
 from modules.proactive_service import ProactiveService
 from modules.ws_orchestrator_service import WsOrchestratorService
 from modules.morning_briefing_module import MorningBriefingModule
+from modules.tmap_service import TmapService
+from modules.live_seoul_summary_service import LiveSeoulSummaryService
+from modules.context_runtime_service import ContextRuntimeService
+from modules.audio_stt_utils import create_push_stream
+from modules.audio_stt_utils import create_recognizer as create_azure_recognizer
+from modules.http_api_routes import create_api_router
+from modules.briefing_runtime_service import BriefingRuntimeService
+from modules import conversation_text_utils
+from modules import runtime_env as runtime_env_utils
+from modules import route_text_utils
+from modules.fast_intent_router import fast_route_intent as fast_route_intent_core
+from modules.transit_runtime_service import TransitRuntimeService
 
 from contextlib import asynccontextmanager
 
@@ -89,6 +96,20 @@ print(f"[Config] GEMINI_DIRECT_AUDIO_INPUT={GEMINI_DIRECT_AUDIO_INPUT}")
 print(f"[Config] ORCHESTRATION_SINGLE_PATH={ORCHESTRATION_SINGLE_PATH}")
 print(f"[Config] EFFECTIVE_GEMINI_DIRECT_AUDIO_INPUT={EFFECTIVE_GEMINI_DIRECT_AUDIO_INPUT}")
 
+RUNTIME_ENV_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ".env",
+)
+
+BRIEFING_PRE_AD_COPY = (
+    "오늘의 브리핑을 시작하기 전, Aira가 전하는 꿀정보! "
+    "효과음: 키보드 엔터, 탁! "
+    "복잡한 B2B 솔루션 도입, 아직도 헤매시나요? "
+    "마이크로소프트 애저 마켓플레이스에선 클릭 한 번에 배포 끝! "
+    "남은 클라우드 예산으로 결제 혜택까지 알뜰하게 챙기세요. "
+    "비즈니스의 정답, 애저!"
+)
+
 try:
     NEWS_AGENT = NewsAgent()
 except Exception as e:
@@ -101,92 +122,30 @@ except Exception as e:
     MORNING_BRIEFING = None
     print(f"[MorningBriefing] init failed: {e}")
 
+TMAP_SERVICE = TmapService(TMAP_APP_KEY, log=print)
+TRANSIT_RUNTIME = TransitRuntimeService(
+    odsay_api_key=ODSAY_API_KEY,
+    seoul_api_key=SEOUL_API_KEY,
+    tmap_app_key=TMAP_APP_KEY,
+    tmap_service=TMAP_SERVICE,
+    log=print,
+)
+CONTEXT_RUNTIME = ContextRuntimeService(
+    odsay_api_key=ODSAY_API_KEY,
+    tmap_service=TMAP_SERVICE,
+    env_cache_ttl_sec=ENV_CACHE_TTL_SEC,
+    haversine_meters=TRANSIT_RUNTIME.haversine_meters,
+    home_lat=HOME_LAT,
+    home_lng=HOME_LNG,
+    log=print,
+)
+
 news_context_service = NewsContextService(news_agent=NEWS_AGENT, log=print)
 ws_orchestrator = WsOrchestratorService()
 
-
-intent_router = None
-
-
-def _now_kst_text():
-    now = datetime.now(ZoneInfo("Asia/Seoul"))
-    return now.strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _http_get_json(url: str, timeout: int = 6):
-    try:
-        req = urllib.request.Request(url, method="GET")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8", errors="ignore")
-            return json.loads(body)
-    except Exception as e:
-        print(f"[SeoulInfo] HTTP error: {e}")
-        return None
-
-
-def _http_get_json_with_headers(url: str, headers: dict | None = None, timeout: int = 6):
-    try:
-        req = urllib.request.Request(url, method="GET", headers=headers or {})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8", errors="ignore")
-            return json.loads(body)
-    except Exception as e:
-        print(f"[SeoulInfo] HTTP error: {e}")
-        return None
-
-
-def _to_float(value):
-    try:
-        return float(value)
-    except Exception:
-        return None
-
-
-def _resolve_home_coords():
-    lat = _to_float(HOME_LAT)
-    lng = _to_float(HOME_LNG)
-    if lat is None or lng is None:
-        return None, None
-    return lat, lng
-
-
-def _extract_destination_from_text(text: str):
-    s = str(text or "").strip()
-    if not s:
-        return None
-    # Korean patterns: "...까지", "...으로/로", "...가려면", "...가는"
-    patterns = [
-        r"([가-힣A-Za-z0-9\s]{1,30})\s*까지",
-        r"([가-힣A-Za-z0-9\s]{1,30})\s*(?:으로|로)\s*가",
-        r"([가-힣A-Za-z0-9\s]{1,30})\s*가려면",
-        r"([가-힣A-Za-z0-9\s]{1,30})\s*가는",
-        r"([가-힣A-Za-z0-9\s]{1,30})\s*가는\s*길",
-        r"([가-힣A-Za-z0-9\s]{1,30})\s*가는길",
-        r"([가-힣A-Za-z0-9\s]{1,30})\s*(?:가는|갈|가능)\s*방법",
-        r"([가-힣A-Za-z0-9\s]{1,30})\s*에서\s*약속",
-        r"([가-힣A-Za-z0-9\s]{1,30})\s*쪽(?:으로)?",
-        r"([가-힣A-Za-z0-9\s]{1,30})\s*(?:에|에서)\s*가",
-    ]
-    for p in patterns:
-        m = re.search(p, s)
-        if m:
-            cand = re.sub(r"\s+", " ", m.group(1)).strip()
-            cand = re.sub(r"(쪽|근처|부근|방향)$", "", cand).strip()
-            if cand and cand not in ("집", "회사", "학교", "거기", "여기"):
-                return cand
-    # "성수역으로", "강남으로" 같은 단문 보강
-    m2 = re.search(r"([가-힣A-Za-z0-9]{2,20})(?:역)?\s*(?:으로|로)$", s)
-    if m2:
-        cand = m2.group(1).strip()
-        if cand:
-            return cand
-    # "성수 방법", "성수 경로"처럼 짧은 목적지+키워드 패턴
-    m3 = re.search(r"([가-힣A-Za-z0-9]{2,20})\s*(?:방법|경로)$", s)
-    if m3:
-        cand = m3.group(1).strip()
-        if cand:
-            return cand
-    return None
+_to_float = CONTEXT_RUNTIME.to_float
+_resolve_home_coords = CONTEXT_RUNTIME.resolve_home_coords
+_extract_destination_from_text = route_text_utils.extract_destination_from_text
 
 
 intent_router = IntentRouter(
@@ -198,840 +157,74 @@ intent_router = IntentRouter(
 )
 
 
-def _extract_news_topic_from_text(text: str):
-    return news_context_service.extract_topic(text)
-
-
-def _get_news_headlines(topic: str | None, limit: int = 3):
-    return news_context_service.get_headlines(topic=topic, limit=limit)
-
-
-def _get_news_items(topic: str | None, limit: int = 3):
-    return news_context_service.get_items(topic=topic, limit=limit)
-
-
-def _is_news_detail_query(text: str) -> bool:
-    return news_context_service.is_detail_query(text)
-
-
-def _is_news_followup_query(text: str) -> bool:
-    return news_context_service.is_followup_query(text)
-
-
-def _select_news_item_by_text(text: str, items: list[dict]):
-    return news_context_service.select_item_by_text(text=text, items=items)
-
-
-def _build_news_detail_summary(item: dict) -> str:
-    return news_context_service.build_detail_summary(item)
-
-
-def _is_vision_related_query(text: str) -> bool:
-    t = str(text or "")
-    if not t:
-        return False
-    keywords = [
-        "화면", "보여", "보이", "보여줘", "사진", "이미지", "이거", "저거",
-        "무엇", "뭐야", "무슨", "읽어", "글자", "문서", "차트", "표", "슬라이드",
-        "색", "옷", "어울려", "보이는", "scene", "screen", "image", "what do you see",
-    ]
-    return any(k in t.lower() for k in keywords)
-
-
-def _is_vision_followup_utterance(text: str) -> bool:
-    t = str(text or "").strip()
-    if not t:
-        return False
-    compact = re.sub(r"[\s\W_]+", "", t)
-    if len(compact) <= 8:
-        return True
-    hints = [
-        "지금", "이번엔", "그럼", "다시", "이건", "저건", "그건",
-        "어때", "맞아", "아니", "들고", "보여", "보이나", "잘안",
-    ]
-    return any(h in t for h in hints)
-
-
-def _is_congestion_query(text: str) -> bool:
-    t = str(text or "").lower()
-    if not t:
-        return False
-    keys = [
-        "혼잡", "붐", "여유", "덜 붐비", "칸", "인파", "crowd", "congestion",
-    ]
-    return any(k in t for k in keys)
-
-
-def _normalize_place_name(name: str | None) -> str:
-    if not name:
-        return ""
-    return re.sub(r"\s+", "", str(name)).lower()
-
-
-def _is_home_update_utterance(text: str) -> bool:
-    t = str(text or "")
-    if not t:
-        return False
-    keywords = [
-        "이사",
-        "집은",
-        "우리 집",
-        "우리집",
-        "집 주소",
-        "집 위치",
-        "집 도착역",
-        "집 근처 역",
-        "집이 ",
-    ]
-    return any(k in t for k in keywords)
-
-
-def _build_destination_candidates(name: str | None):
-    raw = str(name or "").strip()
-    if not raw:
-        return []
-    cands = []
-
-    def _add(v: str):
-        t = str(v or "").strip()
-        if t and t not in cands:
-            cands.append(t)
-
-    base = raw
-    _add(base)
-    # Remove common trailing particles/noise from STT.
-    cleaned = re.sub(r"(으로|로|에|에서|쪽|근처|부근|방향|가는길|가는 길|가는|갈|방법|경로)$", "", base).strip()
-    _add(cleaned)
-    compact = re.sub(r"\s+", "", cleaned)
-    _add(compact)
-
-    for seed in [base, cleaned, compact]:
-        if seed and not seed.endswith("역"):
-            _add(seed + "역")
-    return [x for x in cands if x]
-
-
-def _resolve_destination_coords_from_name(name: str):
-    if not ODSAY_API_KEY or not name:
-        return None, None
-
-    def _search_station(station_name: str):
-        query = urllib.parse.urlencode({"apiKey": ODSAY_API_KEY, "stationName": station_name})
-        url = f"https://api.odsay.com/v1/api/searchStation?{query}"
-        data = _http_get_json(url, timeout=6)
-        if not isinstance(data, dict):
-            return None, None
-        result = data.get("result", {})
-        station_list = result.get("station") if isinstance(result, dict) else None
-        if isinstance(station_list, list) and station_list:
-            first = station_list[0] if isinstance(station_list[0], dict) else {}
-            x = _to_float(first.get("x"))
-            y = _to_float(first.get("y"))
-            return y, x
-        return None, None
-
-    candidates = _build_destination_candidates(name)
-
-    for cand in candidates:
-        y, x = _search_station(cand)
-        if y is not None and x is not None:
-            return y, x
-
-    return None, None
-
-
-def _to_int(value):
-    try:
-        return int(float(value))
-    except Exception:
-        return None
-
-
-def _round_eta_minutes(total_seconds: int) -> int:
-    if total_seconds <= 0:
-        return 0
-    # Conservative rounding for boarding decisions:
-    # 3m30s -> about 3 minutes (not 4), while keeping sub-1m as 1.
-    return max(1, total_seconds // 60)
-
-
-def _parse_eta_minutes_from_message(message: str):
-    text = str(message or "")
-    m = re.search(r"(\d+)\s*\uBD84(?:\s*(\d+)\s*\uCD08)?", text)
-    if m:
-        mm = int(m.group(1) or 0)
-        ss = int(m.group(2) or 0)
-        return _round_eta_minutes(mm * 60 + ss)
-    if re.search(r"\uC804\uC5ED\s*\uB3C4\uCC29", text):
-        return 1
-    if re.search(r"\uACF3\s*\uB3C4\uCC29|\uC7A0\uC2DC\s*\uD6C4|\uC9C4\uC785|\uB3C4\uCC29", text):
-        return 0
-    return None
-
-def _extract_arrival_minutes(row: dict, allow_zero: bool = True):
-    raw_seconds = _to_int(row.get("barvlDt"))
-    if raw_seconds is not None and raw_seconds > 0:
-        return _round_eta_minutes(raw_seconds)
-    if raw_seconds == 0 and allow_zero:
-        return 0
-    parsed = _parse_eta_minutes_from_message(str(row.get("arvlMsg2", "")))
-    if parsed == 0 and not allow_zero:
-        return None
-    return parsed
-
-
-def _format_eta_phrase(minutes: int | None) -> str | None:
-    if minutes is None:
-        return None
-    if minutes <= 2:
-        return "곧 도착"
-    return f"약 {minutes}분"
-
-
-def _haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    r = 6371000.0
-    p1 = math.radians(lat1)
-    p2 = math.radians(lat2)
-    dp = math.radians(lat2 - lat1)
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return r * c
-
-
-def _estimate_walk_minutes(lat: float, lng: float, station_lat: float | None, station_lng: float | None):
-    if station_lat is None or station_lng is None:
-        return None
-    distance_m = _haversine_meters(lat, lng, station_lat, station_lng)
-    # Inflate straight-line distance to approximate real walking path.
-    path_m = distance_m * 1.25
-    speed_m_per_min = 4200 / 60  # ~4.2km/h
-    return max(1, int(round(path_m / speed_m_per_min)))
-
-
-def _pick_station_from_odsay_response(data):
-    if not isinstance(data, dict):
-        return None
-
-    if data.get("error"):
-        print(f"[SeoulInfo] ODSAY error: {data.get('error')}")
-    if data.get("result", {}).get("error"):
-        print(f"[SeoulInfo] ODSAY result error: {data.get('result', {}).get('error')}")
-
-    result = data.get("result", {})
-    candidates = []
-    if isinstance(result, dict):
-        for key in ("station", "stationInfo", "stations"):
-            value = result.get(key)
-            if isinstance(value, list):
-                candidates.extend([x for x in value if isinstance(x, dict)])
-
-    if not candidates and isinstance(result, list):
-        candidates = [x for x in result if isinstance(x, dict)]
-
-    if not candidates:
-        return None
-
-    first = candidates[0]
-    name = str(first.get("stationName") or first.get("stationNm") or first.get("name") or "").strip()
-    if not name:
-        return None
-
-    raw_lng = first.get("x") or first.get("gpsX") or first.get("lon") or first.get("longitude")
-    raw_lat = first.get("y") or first.get("gpsY") or first.get("lat") or first.get("latitude")
-    station_lng = float(raw_lng) if raw_lng is not None else None
-    station_lat = float(raw_lat) if raw_lat is not None else None
-
-    return {
-        "name": name,
-        "lat": station_lat,
-        "lng": station_lng,
-    }
-
-
-def _get_nearby_station(lat: float, lng: float, station_class: int | None = 2, log_label: str = "station"):
-    if not ODSAY_API_KEY:
-        return None
-
-    # Try wider search radii and flexible parameter sets because pointSearch
-    # responses vary by account tier/region and nearby station density.
-    for radius in (800, 1500, 3000):
-        for include_station_class in (True, False):
-            params = {
-                "apiKey": ODSAY_API_KEY,
-                "x": lng,  # longitude
-                "y": lat,  # latitude
-                "radius": radius,
-            }
-            if include_station_class:
-                if station_class is None:
-                    continue
-                params["stationClass"] = station_class
-
-            query = urllib.parse.urlencode(params)
-            url = f"https://api.odsay.com/v1/api/pointSearch?{query}"
-            data = _http_get_json(url)
-            picked = _pick_station_from_odsay_response(data)
-            if picked:
-                return picked
-
-    print(f"[SeoulInfo] ODSAY nearby {log_label} not found (lat={lat}, lng={lng})")
-    return None
-
-
-def _get_nearby_bus_stop(lat: float, lng: float):
-    return _get_nearby_station(lat, lng, station_class=1, log_label="bus stop")
-
-
-def _get_subway_arrival(station_name: str):
-    if not SEOUL_API_KEY:
-        return []
-
-    safe_station = urllib.parse.quote(station_name)
-    url = (
-        f"http://swopenapi.seoul.go.kr/api/subway/{SEOUL_API_KEY}/json/"
-        f"realtimeStationArrival/0/5/{safe_station}"
-    )
-    data = _http_get_json(url)
-    if not isinstance(data, dict):
-        return []
-
-    rows = data.get("realtimeArrivalList", [])
-    return rows if isinstance(rows, list) else []
-
-
-def _weekday_to_tmap_dow(dt: datetime) -> int:
-    # Tmap subway congestion uses 1~7, Monday=1.
-    return int(dt.weekday()) + 1
-
-
-def _normalize_route_name_for_tmap(line_text: str | None) -> str | None:
-    s = str(line_text or "").strip()
-    if not s:
-        return None
-    m = re.search(r"(\d+)\s*호선", s)
-    if m:
-        return f"{m.group(1)}호선"
-    m2 = re.search(r"(\d+)\s*line", s, flags=re.IGNORECASE)
-    if m2:
-        return f"{m2.group(1)}호선"
-    return s
-
-
-def _extract_tmap_congestion_rows(payload: dict | None) -> list[dict]:
-    if not isinstance(payload, dict):
-        return []
-
-    rows = []
-    # Common wrappers seen across SK open APIs.
-    for key in ("data", "result", "contents", "response", "body"):
-        value = payload.get(key)
-        if isinstance(value, list):
-            rows.extend([x for x in value if isinstance(x, dict)])
-        elif isinstance(value, dict):
-            for inner in ("data", "list", "items", "cars", "car", "contents"):
-                v2 = value.get(inner)
-                if isinstance(v2, list):
-                    rows.extend([x for x in v2 if isinstance(x, dict)])
-
-    # Fallback: payload itself might already represent a row-ish object list under unknown key.
-    if not rows:
-        for _, value in payload.items():
-            if isinstance(value, list) and value and isinstance(value[0], dict):
-                rows.extend([x for x in value if isinstance(x, dict)])
-
-    # Normalize car/score fields.
-    normalized = []
-    for row in rows:
-        car_no = None
-        for ck in ("carNo", "carNum", "car_number", "car"):
-            raw = row.get(ck)
-            if raw is not None:
-                car_no = str(raw).strip()
-                break
-        score = None
-        for sk in ("score", "congestion", "congestionScore", "crowd", "value"):
-            raw = row.get(sk)
-            if raw is not None:
-                score = _to_float(raw)
-                if score is not None:
-                    break
-        if car_no and score is not None:
-            normalized.append({"car": car_no, "score": score, "raw": row})
-    return normalized
-
-
-def _get_tmap_subway_car_congestion(route_name: str | None, station_name: str | None):
-    if not TMAP_APP_KEY:
-        return None
-    route_nm = _normalize_route_name_for_tmap(route_name)
-    station_nm = str(station_name or "").strip()
-    if not route_nm or not station_nm:
-        return None
-
-    now = datetime.now(ZoneInfo("Asia/Seoul"))
-    query = urllib.parse.urlencode(
-        {
-            "routeNm": route_nm,
-            "stationNm": station_nm,
-            "dow": _weekday_to_tmap_dow(now),
-            "hh": now.hour,
-        }
-    )
-    url = f"https://apis.openapi.sk.com/transit/puzzle/subway/congestion/stat/car?{query}"
-    data = _http_get_json_with_headers(
-        url,
-        headers={"appKey": TMAP_APP_KEY, "accept": "application/json"},
-        timeout=6,
-    )
-    rows = _extract_tmap_congestion_rows(data)
-    if not rows:
-        return None
-    least = min(rows, key=lambda x: float(x.get("score") or 9999.0))
-    return {
-        "routeNm": route_nm,
-        "stationNm": station_nm,
-        "leastCar": least.get("car"),
-        "leastScore": least.get("score"),
-        "cars": rows,
-    }
-
-
-def _get_odsay_path(sx: float, sy: float, ex: float, ey: float, search_path_type: int = 0):
-    if not ODSAY_API_KEY:
-        return None
-    query = urllib.parse.urlencode(
-        {
-            "apiKey": ODSAY_API_KEY,
-            "SX": sx,
-            "SY": sy,
-            "EX": ex,
-            "EY": ey,
-            "SearchPathType": search_path_type,  # 0=all, 1=subway
-        }
-    )
-    url = f"https://api.odsay.com/v1/api/searchPubTransPathT?{query}"
-    data = _http_get_json(url, timeout=8)
-    if not isinstance(data, dict):
-        return None
-    if data.get("error"):
-        print(f"[SeoulInfo] ODSAY path error: {data.get('error')}")
-    result = data.get("result", {})
-    paths = result.get("path") if isinstance(result, dict) else None
-    if isinstance(paths, list) and paths:
-        return paths[0] if isinstance(paths[0], dict) else None
-    return None
-
-
-def _parse_odsay_strategy(path_obj: dict):
-    if not isinstance(path_obj, dict):
-        return {}
-    info = path_obj.get("info", {}) if isinstance(path_obj.get("info"), dict) else {}
-    sub_paths = path_obj.get("subPath", []) if isinstance(path_obj.get("subPath"), list) else []
-
-    first_ride = None
-    for seg in sub_paths:
-        if not isinstance(seg, dict):
-            continue
-        traffic_type = _to_int(seg.get("trafficType"))
-        if traffic_type in (1, 2):
-            first_ride = seg
-            break
-
-    strategy = {
-        "totalTimeMinutes": _to_int(info.get("totalTime")),
-        "payment": _to_int(info.get("payment")),
-        "transferCount": _to_int(info.get("busTransitCount")) if _to_int(info.get("busTransitCount")) is not None else _to_int(info.get("subwayTransitCount")),
-        "firstMode": None,
-        "firstBoardName": None,
-        "firstDirection": None,
-        "firstStartLat": _to_float(first_ride.get("startY")) if isinstance(first_ride, dict) else None,
-        "firstStartLng": _to_float(first_ride.get("startX")) if isinstance(first_ride, dict) else None,
-        "busNumbers": [],
-        "subwayLine": None,
-        "subwayLegs": [],
-    }
-
-    if isinstance(first_ride, dict):
-        tt = _to_int(first_ride.get("trafficType"))
-        lane = first_ride.get("lane", [])
-        lane0 = lane[0] if isinstance(lane, list) and lane and isinstance(lane[0], dict) else {}
-        strategy["firstBoardName"] = first_ride.get("startName")
-        strategy["firstDirection"] = first_ride.get("way")
-
-        if tt == 2:
-            strategy["firstMode"] = "bus"
-            bus_nos = []
-            if isinstance(lane, list):
-                for l in lane:
-                    if isinstance(l, dict):
-                        no = l.get("busNo")
-                        if no:
-                            bus_nos.append(str(no))
-            strategy["busNumbers"] = bus_nos
-        elif tt == 1:
-            strategy["firstMode"] = "subway"
-            strategy["subwayLine"] = lane0.get("name")
-
-    # Capture full subway-leg sequence for detailed transfer guidance.
-    subway_legs = []
-    for seg in sub_paths:
-        if not isinstance(seg, dict):
-            continue
-        if _to_int(seg.get("trafficType")) != 1:
-            continue
-        lane = seg.get("lane", [])
-        lane0 = lane[0] if isinstance(lane, list) and lane and isinstance(lane[0], dict) else {}
-        subway_legs.append(
-            {
-                "line": str(lane0.get("name") or "").strip(),
-                "start": str(seg.get("startName") or "").strip(),
-                "end": str(seg.get("endName") or "").strip(),
-                "direction": str(seg.get("way") or "").strip(),
-            }
-        )
-    strategy["subwayLegs"] = [x for x in subway_legs if x.get("line") and x.get("start") and x.get("end")]
-
-    return strategy
-
-
-def _get_weather_only(lat: float, lng: float):
-    weather = {}
-    w_url = (
-        "https://api.open-meteo.com/v1/forecast?"
-        + urllib.parse.urlencode(
-            {
-                "latitude": lat,
-                "longitude": lng,
-                "current": "temperature_2m,precipitation,rain,cloud_cover,weather_code",
-                "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
-                "forecast_days": 1,
-                "timezone": "Asia/Seoul",
-            }
-        )
-    )
-    w = _http_get_json(w_url, timeout=6)
-    if isinstance(w, dict):
-        cur = w.get("current", {}) if isinstance(w.get("current"), dict) else {}
-        daily = w.get("daily", {}) if isinstance(w.get("daily"), dict) else {}
-        daily_max = daily.get("temperature_2m_max") if isinstance(daily.get("temperature_2m_max"), list) else []
-        daily_min = daily.get("temperature_2m_min") if isinstance(daily.get("temperature_2m_min"), list) else []
-        daily_pop = daily.get("precipitation_probability_max") if isinstance(daily.get("precipitation_probability_max"), list) else []
-        cloud_cover = _to_float(cur.get("cloud_cover"))
-        weather_code = _to_int(cur.get("weather_code"))
-        is_cloudy = (cloud_cover is not None and cloud_cover >= 60) or (weather_code in {2, 3, 45, 48} if weather_code is not None else False)
-        weather = {
-            "tempC": _to_float(cur.get("temperature_2m")),
-            "precipitationMm": _to_float(cur.get("precipitation")),
-            "rainMm": _to_float(cur.get("rain")),
-            "cloudCoverPct": cloud_cover,
-            "weatherCode": weather_code,
-            "isCloudy": bool(is_cloudy),
-            "skyText": "흐림" if is_cloudy else "대체로 맑음",
-            "todayMaxC": _to_float(daily_max[0]) if daily_max else None,
-            "todayMinC": _to_float(daily_min[0]) if daily_min else None,
-            "precipProbPct": _to_int(daily_pop[0]) if daily_pop else None,
-            "fetchedAtTs": int(time.time()),
-        }
-    return weather
-
-def _get_air_only(lat: float, lng: float):
-    aq_url = (
-        "https://air-quality-api.open-meteo.com/v1/air-quality?"
-        + urllib.parse.urlencode(
-            {
-                "latitude": lat,
-                "longitude": lng,
-                "current": "us_aqi,pm10,pm2_5",
-                "timezone": "Asia/Seoul",
-            }
-        )
-    )
-    aq = _http_get_json(aq_url, timeout=6)
-    air = {}
-    if isinstance(aq, dict) and isinstance(aq.get("current"), dict):
-        cur = aq.get("current")
-        us_aqi = _to_int(cur.get("us_aqi"))
-        grade = None
-        if us_aqi is not None:
-            if us_aqi <= 50:
-                grade = "좋음"
-            elif us_aqi <= 100:
-                grade = "보통"
-            elif us_aqi <= 150:
-                grade = "민감군 주의"
-            elif us_aqi <= 200:
-                grade = "나쁨"
-            else:
-                grade = "매우 나쁨"
-        air = {
-            "usAqi": us_aqi,
-            "pm10": _to_float(cur.get("pm10")),
-            "pm25": _to_float(cur.get("pm2_5")),
-            "grade": grade,
-            "fetchedAtTs": int(time.time()),
-        }
-    return air
-
-def _get_weather_and_air(lat: float, lng: float):
-    weather = _get_weather_only(lat, lng)
-    air = _get_air_only(lat, lng)
-    return weather, air
-
-
-def _is_env_cache_fresh(env_cache: dict | None, lat: float | None, lng: float | None) -> bool:
-    if not isinstance(env_cache, dict):
-        return False
-    ts = float(env_cache.get("ts") or 0.0)
-    if ts <= 0:
-        return False
-    if (time.monotonic() - ts) > ENV_CACHE_TTL_SEC:
-        return False
-    cache_lat = _to_float(env_cache.get("lat"))
-    cache_lng = _to_float(env_cache.get("lng"))
-    if lat is None or lng is None or cache_lat is None or cache_lng is None:
-        return True
-    # If user moved materially, refresh cache.
-    return _haversine_meters(cache_lat, cache_lng, lat, lng) < 200
-
-
-def _build_live_seoul_summary(
-    lat: float | None,
-    lng: float | None,
-    station_name: str | None,
-    destination_name: str | None = None,
-    prefer_subway: bool = False,
-    detailed_subway: bool = False,
-):
-    station = station_name.strip() if isinstance(station_name, str) and station_name.strip() else None
-    station_lat = None
-    station_lng = None
-
-    bus_stop_name = None
-    walk_to_bus_stop_min = None
-
-    if lat is not None and lng is not None:
-        nearby_subway = _get_nearby_station(lat, lng)
-        if isinstance(nearby_subway, dict):
-            if not station:
-                station = nearby_subway.get("name")
-            station_lat = nearby_subway.get("lat")
-            station_lng = nearby_subway.get("lng")
-
-        nearby_bus = _get_nearby_bus_stop(lat, lng)
-        if isinstance(nearby_bus, dict):
-            bus_stop_name = nearby_bus.get("name")
-            walk_to_bus_stop_min = _estimate_walk_minutes(lat, lng, nearby_bus.get("lat"), nearby_bus.get("lng"))
-
-    destination_requested = bool(destination_name and str(destination_name).strip())
-    target_lat, target_lng = _resolve_destination_coords_from_name(destination_name) if destination_requested else (None, None)
-    destination_resolved = target_lat is not None and target_lng is not None
-    # Only use default home coords when user did not explicitly request another destination.
-    if not destination_requested and (target_lat is None or target_lng is None):
-        target_lat, target_lng = _resolve_home_coords()
-        destination_resolved = target_lat is not None and target_lng is not None
-    strategy = {}
-    if lat is not None and lng is not None and target_lat is not None and target_lng is not None:
-        path_type = 1 if prefer_subway else 0
-        path_obj = _get_odsay_path(sx=lng, sy=lat, ex=target_lng, ey=target_lat, search_path_type=path_type)
-        strategy = _parse_odsay_strategy(path_obj) if isinstance(path_obj, dict) else {}
-        # If subway-only path fails, fallback to general path to preserve minimum guidance.
-        if prefer_subway and strategy.get("firstMode") != "subway":
-            fallback_obj = _get_odsay_path(sx=lng, sy=lat, ex=target_lng, ey=target_lat, search_path_type=0)
-            fallback_strategy = _parse_odsay_strategy(fallback_obj) if isinstance(fallback_obj, dict) else {}
-            if isinstance(fallback_strategy, dict) and fallback_strategy:
-                strategy = fallback_strategy
-
-    weather = {}
-    air = {}
-    if lat is not None and lng is not None:
-        weather, air = _get_weather_and_air(lat, lng)
-
-    first_mode = strategy.get("firstMode")
-    first_board = strategy.get("firstBoardName")
-    first_direction = strategy.get("firstDirection")
-    subway_line = strategy.get("subwayLine")
-    bus_numbers = strategy.get("busNumbers") or []
-    subway_legs = strategy.get("subwayLegs") or []
-    subway_congestion = None
-
-    departure_station = first_board if first_mode == "subway" and first_board else station
-    if first_mode == "subway":
-        subway_congestion = _get_tmap_subway_car_congestion(
-            route_name=subway_line,
-            station_name=departure_station,
-        )
-    arrivals = _get_subway_arrival(departure_station) if departure_station else []
-    rows = [r for r in arrivals if isinstance(r, dict)]
-    rows.sort(key=lambda r: str(r.get("ordkey", "")))
-
-    # If line hint exists, prioritize rows matching that line text.
-    if subway_line:
-        line_token = str(subway_line).split("(")[0].strip()
-        matched = [r for r in rows if line_token and line_token in str(r.get("trainLineNm", ""))]
-        if matched:
-            rows = matched
-
-    first = rows[0] if rows else {}
-    second = rows[1] if len(rows) > 1 else {}
-
-    first_eta = _extract_arrival_minutes(first, allow_zero=True) if first else None
-    next_eta = _extract_arrival_minutes(second, allow_zero=False) if second else None
-    if first_eta is not None and next_eta is not None and next_eta <= first_eta:
-        next_eta = None
-
-    # Walking time to first boarding point (prefer ODSAY first segment coords)
-    walk_to_departure_min = None
-    if lat is not None and lng is not None:
-        walk_to_departure_min = _estimate_walk_minutes(
-            lat,
-            lng,
-            strategy.get("firstStartLat") if strategy else station_lat,
-            strategy.get("firstStartLng") if strategy else station_lng,
-        )
-
-    decision = None
-    if first_mode == "subway":
-        if walk_to_departure_min is not None and first_eta is not None:
-            if walk_to_departure_min < first_eta:
-                decision = "first"
-            else:
-                if next_eta is not None:
-                    if walk_to_departure_min < next_eta:
-                        decision = "next"
-                    else:
-                        decision = "after_next"
-                else:
-                    decision = "after_next"
-        else:
-            decision = "first"
-
-    parts = []
-
-    if destination_requested and not destination_resolved:
-        parts.append(f"'{destination_name}' 목적지를 역 기준으로 찾지 못했어요. 예: 성수역, 강남역처럼 말씀해 주세요.")
-        if station:
-            parts.append(f"현재 기준 가장 가까운 역은 {station}역이에요.")
-    elif prefer_subway:
-        # Commute-home default: always speak in subway terms.
-        if not departure_station:
-            parts.append("지하철 출발역을 찾지 못했어요. 역 이름을 말씀해 주시면 바로 확인해 드릴게요.")
-        else:
-            line_text = str(subway_line or first.get("trainLineNm") or "해당 노선")
-            direction_text = str(first_direction or first.get("trainLineNm") or "방면 정보 확인 중")
-            parts.append(f"지하철로 가시려면 {departure_station}역에서 {line_text}을 타시면 돼요.")
-            parts.append(f"탑승 방면은 {direction_text}입니다.")
-            if walk_to_departure_min is not None:
-                parts.append(f"현재 위치에서 출발역까지 도보 약 {walk_to_departure_min}분 걸려요.")
-            eta_phrase = _format_eta_phrase(first_eta)
-            if eta_phrase:
-                parts.append(f"이번 열차는 {eta_phrase}이에요.")
-
-            if decision == "next" and next_eta is not None:
-                next_phrase = _format_eta_phrase(next_eta) or f"약 {next_eta}분"
-                parts.append(f"현재 이동 시간 기준으로 이번 열차는 어렵고, 다음 열차({next_phrase} 후)를 권장해요.")
-            elif decision == "after_next":
-                parts.append("현재 이동 시간 기준으로 이번/다음 열차 모두 어렵습니다. 역 도착 후 다음 열차 시간을 다시 확인해 주세요.")
-            elif decision == "first":
-                parts.append("지금 출발하면 이번 열차 탑승 가능성이 있어요.")
-            if isinstance(subway_congestion, dict):
-                least_car = str(subway_congestion.get("leastCar") or "").strip()
-                if least_car:
-                    parts.append(f"혼잡도 기준으로는 {least_car}칸이 가장 여유로운 편입니다.")
-
-            if detailed_subway and subway_legs:
-                first_leg = subway_legs[0]
-                parts.append(
-                    f"상세 경로는 {first_leg.get('start')}역에서 {first_leg.get('line')} "
-                    f"{first_leg.get('direction') or '방면'} 열차를 타고 {first_leg.get('end')}역에서 내리시면 돼요."
-                )
-                if len(subway_legs) > 1:
-                    for idx, leg in enumerate(subway_legs[1:], start=2):
-                        parts.append(
-                            f"{idx-1}차 환승은 {leg.get('start')}역에서 {leg.get('line')} "
-                            f"{leg.get('direction') or '방면'}으로 갈아타고 {leg.get('end')}역에서 내리시면 돼요."
-                        )
-
-    elif first_mode == "bus":
-        parts.append("가장 빠른 대중교통 시작 구간은 버스예요.")
-        if bus_numbers:
-            parts.append(f"탑승 버스 번호는 {', '.join(bus_numbers)}입니다.")
-        if first_board:
-            parts.append(f"탑승 정류장은 {first_board}입니다.")
-        if walk_to_departure_min is not None:
-            parts.append(f"현재 위치에서 그 정류장까지 도보 약 {walk_to_departure_min}분 걸려요.")
-        elif bus_stop_name and walk_to_bus_stop_min is not None:
-            parts.append(f"가장 가까운 정류장 {bus_stop_name}까지 도보 약 {walk_to_bus_stop_min}분 걸려요.")
-
-    elif first_mode == "subway":
-        line_text = str(subway_line or first.get("trainLineNm") or "해당 노선")
-        direction_text = str(first_direction or first.get("trainLineNm") or "방면 정보 없음")
-        parts.append(f"지하철 기준 가장 빠른 경로는 {departure_station}역에서 {line_text} 열차 탑승이에요.")
-        parts.append(f"탑승 방면은 {direction_text}입니다.")
-
-        if walk_to_departure_min is not None:
-            parts.append(f"현재 위치에서 출발역까지 도보 약 {walk_to_departure_min}분 걸려요.")
-        eta_phrase = _format_eta_phrase(first_eta)
-        if eta_phrase:
-            parts.append(f"출발역 기준 이번 열차는 {eta_phrase}이에요.")
-
-        if decision == "next" and next_eta is not None:
-            next_phrase = _format_eta_phrase(next_eta) or f"약 {next_eta}분"
-            parts.append(f"지금 이동하면 이번 열차는 어렵고, 다음 열차는 {next_phrase} 후예요.")
-        elif decision == "after_next":
-            parts.append("지금 이동하면 이번/다음 열차 모두 어렵습니다. 역 도착 후 다음 열차 시간을 다시 확인해 주세요.")
-        elif decision == "first":
-            parts.append("지금 출발하면 이번 열차 탑승 가능성이 있어요.")
-        if isinstance(subway_congestion, dict):
-            least_car = str(subway_congestion.get("leastCar") or "").strip()
-            if least_car:
-                parts.append(f"혼잡도 기준으로는 {least_car}칸이 가장 여유로운 편입니다.")
-
-        if detailed_subway and subway_legs:
-            first_leg = subway_legs[0]
-            parts.append(
-                f"상세 경로는 {first_leg.get('start')}역에서 {first_leg.get('line')} "
-                f"{first_leg.get('direction') or '방면'} 열차를 타고 {first_leg.get('end')}역에서 내리시면 돼요."
-            )
-            if len(subway_legs) > 1:
-                for idx, leg in enumerate(subway_legs[1:], start=2):
-                    parts.append(
-                        f"{idx-1}차 환승은 {leg.get('start')}역에서 {leg.get('line')} "
-                        f"{leg.get('direction') or '방면'}으로 갈아타고 {leg.get('end')}역에서 내리시면 돼요."
-                    )
-
-    else:
-        if station:
-            parts.append(f"현재 기준 가장 가까운 지하철역은 {station}역이에요.")
-        if bus_stop_name and walk_to_bus_stop_min is not None:
-            parts.append(f"가장 가까운 버스 정류장은 {bus_stop_name}, 도보 약 {walk_to_bus_stop_min}분입니다.")
-
-    if not parts:
-        parts.append("실시간 경로 정보를 충분히 받지 못했어요. 출발지와 목적지를 다시 확인해 주세요.")
-
-    summary = " ".join(parts)
-
-    return {
-        "station": station,
-        "speechSummary": summary,
-        "arrivals": arrivals,
-        "decision": decision,
-        "firstEtaMinutes": first_eta,
-        "nextEtaMinutes": next_eta,
-        "walkToStationMinutes": walk_to_departure_min,
-        "busStopName": bus_stop_name,
-        "walkToBusStopMinutes": walk_to_bus_stop_min,
-        "busNumbers": bus_numbers,
-        "firstMode": first_mode,
-        "firstDirection": first_direction,
-        "subwayCongestion": subway_congestion,
-        "weather": weather,
-        "air": air,
-        "homeConfigured": target_lat is not None and target_lng is not None,
-        "destinationName": destination_name,
-        "destinationRequested": destination_requested,
-        "destinationResolved": destination_resolved,
-    }
+_extract_news_topic_from_text = news_context_service.extract_topic
+_get_news_headlines = news_context_service.get_headlines
+_get_news_items = news_context_service.get_items
+_is_news_detail_query = news_context_service.is_detail_query
+_is_news_followup_query = news_context_service.is_followup_query
+_select_news_item_by_text = news_context_service.select_item_by_text
+_build_news_detail_summary = news_context_service.build_detail_summary
+
+_search_restaurants_nearby = CONTEXT_RUNTIME.search_restaurants_nearby
+
+_is_vision_related_query = conversation_text_utils.is_vision_related_query
+_is_vision_followup_utterance = conversation_text_utils.is_vision_followup_utterance
+_is_congestion_query = route_text_utils.is_congestion_query
+_is_schedule_query = route_text_utils.is_schedule_query
+_is_arrival_eta_query = route_text_utils.is_arrival_eta_query
+_normalize_place_name = route_text_utils.normalize_place_name
+_is_home_update_utterance = conversation_text_utils.is_home_update_utterance
+_resolve_destination_coords_from_name = CONTEXT_RUNTIME.resolve_destination_coords_from_name
+
+_to_int = TRANSIT_RUNTIME.to_int
+_round_eta_minutes = TRANSIT_RUNTIME.round_eta_minutes
+_parse_eta_minutes_from_message = TRANSIT_RUNTIME.parse_eta_minutes_from_message
+_format_eta_phrase = TRANSIT_RUNTIME.format_eta_phrase
+_haversine_meters = TRANSIT_RUNTIME.haversine_meters
+_estimate_walk_minutes = TRANSIT_RUNTIME.estimate_walk_minutes
+_pick_station_from_odsay_response = TRANSIT_RUNTIME.pick_station_from_odsay_response
+_get_nearby_station = TRANSIT_RUNTIME.get_nearby_station
+_get_nearby_bus_stop = TRANSIT_RUNTIME.get_nearby_bus_stop
+_weekday_to_tmap_dow = TRANSIT_RUNTIME.weekday_to_tmap_dow
+_normalize_route_name_for_tmap = TRANSIT_RUNTIME.normalize_route_name_for_tmap
+_extract_tmap_congestion_rows = TRANSIT_RUNTIME.extract_tmap_congestion_rows
+_get_tmap_subway_car_congestion = TRANSIT_RUNTIME.get_tmap_subway_car_congestion
+_get_odsay_path = TRANSIT_RUNTIME.get_odsay_path
+_parse_odsay_strategy = TRANSIT_RUNTIME.parse_odsay_strategy
+_parse_tmap_strategy = TRANSIT_RUNTIME.parse_tmap_strategy
+_strategy_needs_odsay_backfill = TRANSIT_RUNTIME.strategy_needs_odsay_backfill
+_merge_strategy_with_fallback = TRANSIT_RUNTIME.merge_strategy_with_fallback
+
+_extract_schedule_search_dttm = route_text_utils.extract_schedule_search_dttm
+_get_weather_only = CONTEXT_RUNTIME.get_weather_only
+_get_air_only = CONTEXT_RUNTIME.get_air_only
+_get_weather_and_air = CONTEXT_RUNTIME.get_weather_and_air
+_is_env_cache_fresh = CONTEXT_RUNTIME.is_env_cache_fresh
+
+
+LIVE_SEOUL_SUMMARY_SERVICE = LiveSeoulSummaryService(
+    get_nearby_station=_get_nearby_station,
+    get_nearby_bus_stop=_get_nearby_bus_stop,
+    estimate_walk_minutes=_estimate_walk_minutes,
+    resolve_destination_coords_from_name=_resolve_destination_coords_from_name,
+    resolve_home_coords=_resolve_home_coords,
+    is_schedule_query=_is_schedule_query,
+    is_arrival_eta_query=_is_arrival_eta_query,
+    extract_schedule_search_dttm=_extract_schedule_search_dttm,
+    get_transit_route=TMAP_SERVICE.get_transit_route,
+    parse_tmap_strategy=_parse_tmap_strategy,
+    strategy_needs_odsay_backfill=_strategy_needs_odsay_backfill,
+    get_odsay_path=_get_odsay_path,
+    parse_odsay_strategy=_parse_odsay_strategy,
+    merge_strategy_with_fallback=_merge_strategy_with_fallback,
+    get_weather_and_air=_get_weather_and_air,
+    get_tmap_subway_car_congestion=_get_tmap_subway_car_congestion,
+    format_eta_phrase=_format_eta_phrase,
+    get_subway_arrival=TRANSIT_RUNTIME.get_subway_arrival,
+    extract_arrival_minutes=TRANSIT_RUNTIME.extract_arrival_minutes,
+)
+
+_build_live_seoul_summary = LIVE_SEOUL_SUMMARY_SERVICE.build_summary
 
 
 seoul_live_service = SeoulLiveService(
@@ -1045,74 +238,26 @@ seoul_live_service = SeoulLiveService(
     extract_news_topic=_extract_news_topic_from_text,
     get_news_headlines=_get_news_headlines,
     get_news_items=_get_news_items,
+    search_restaurants=_search_restaurants_nearby,
 )
 
-
-def _execute_tools_for_intent(
-    intent: str,
-    lat: float | None,
-    lng: float | None,
-    destination_name: str | None,
-    env_cache: dict | None = None,
-    user_text: str | None = None,
-):
-    return seoul_live_service.execute_tools_for_intent(
-        intent=intent,
-        lat=lat,
-        lng=lng,
-        destination_name=destination_name,
-        env_cache=env_cache,
-        user_text=user_text,
-    )
-
-
-def _fast_route_intent(text: str, active_timer: bool = False):
-    t = str(text or "").strip()
-    if not t:
-        return None
-    norm = re.sub(r"\s+", "", t.lower())
-
-    # Timer cancel should have highest priority while timer is active.
-    if active_timer and any(k in norm for k in ["지금말해", "바로말해", "바로", "지금", "취소", "그만", "중지"]):
-        return {"intent": "timer_cancel", "destination": None, "source": "fast", "home_update": False, "timer_seconds": None}
-
-    timer_match = re.search(r"(\d{1,3})\s*(초|분|시간)\s*(뒤|후)", t)
-    if timer_match:
-        n = int(timer_match.group(1))
-        unit = timer_match.group(2)
-        sec = n if unit == "초" else n * 60 if unit == "분" else n * 3600
-        if 5 <= sec <= 21600:
-            return {"intent": "timer", "destination": None, "source": "fast", "home_update": False, "timer_seconds": sec}
-
-    if any(k in norm for k in ["미세먼지", "초미세", "대기질", "aqi"]):
-        return {"intent": "air_quality", "destination": None, "source": "fast", "home_update": False, "timer_seconds": None}
-
-    if any(k in norm for k in ["날씨", "기온", "강수", "비와", "비와?", "덥", "춥"]):
-        return {"intent": "weather", "destination": None, "source": "fast", "home_update": False, "timer_seconds": None}
-
-    if any(k in norm for k in ["뉴스", "헤드라인", "기사"]):
-        return {"intent": "news", "destination": None, "source": "fast", "home_update": False, "timer_seconds": None}
-
-    return None
+_execute_tools_for_intent = seoul_live_service.execute_tools_for_intent
+_fast_route_intent = lambda text, active_timer=False: fast_route_intent_core(
+    text=text,
+    active_timer=active_timer,
+    destination_extractor=_extract_destination_from_text,
+    arrival_eta_query_checker=_is_arrival_eta_query,
+)
 
 # --- Helper: Azure STT Setup ---
-def create_push_stream(sample_rate=16000):
-    stream_format = speechsdk.audio.AudioStreamFormat(samples_per_second=sample_rate, bits_per_sample=16, channels=1)
-    push_stream = speechsdk.audio.PushAudioInputStream(stream_format=stream_format)
-    audio_config = speechsdk.audio.AudioConfig(stream=push_stream)
-    return push_stream, audio_config
-
-def create_recognizer(audio_config, language="en-US", silence_timeout_ms: str | None = None): # Default to English for now, or use "ko-KR"
-    speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION)
-    speech_config.speech_recognition_language = language
-    # Too-low timeout harms Korean phrase stability. Use tunable default.
-    speech_config.set_property(
-        speechsdk.PropertyId.Speech_SegmentationSilenceTimeoutMs,
-        str(silence_timeout_ms or STT_SEGMENTATION_SILENCE_TIMEOUT_MS),
+def create_recognizer(audio_config, language="en-US", silence_timeout_ms: str | None = None):
+    return create_azure_recognizer(
+        audio_config=audio_config,
+        subscription=AZURE_SPEECH_KEY,
+        region=AZURE_SPEECH_REGION,
+        language=language,
+        silence_timeout_ms=silence_timeout_ms,
     )
-    
-    recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
-    return recognizer
 
 # --- WebSocket Endpoint ---
 @app.websocket("/ws/audio")
@@ -1175,12 +320,12 @@ async def audio_websocket(ws: WebSocket):
     # Inject Memory into System Instruction
     system_instruction = (
         "You are Aira, a warm and practical Korean voice assistant. "
-        "For transit/city/weather/air-quality/news topics, never fabricate facts. "
+        "For transit/city/weather/air-quality/restaurant/news topics, never fabricate facts. "
         "Only state information that is explicitly present in provided live context. "
         "If required data is missing, say what is missing and ask one concise follow-up question. "
         "For subway guidance, include departure station, line/direction, ETA, walking minutes, and whether to take current or next train only when present in live context. "
         "For bus guidance, provide bus number, boarding stop name, and walking minutes when present in live context. "
-        "Do not invent route, direction, ETA, weather, or air-quality values. "
+        "Do not invent route, direction, ETA, weather, air-quality, or restaurant details. "
         "Do not mention crowding/congestion unless explicit congestion data is provided in live context. "
         "For Korean transit questions, never ask user's current location; device coordinates are already provided by server. "
         "If visual context is provided from camera/screen, use it naturally together with voice context. "
@@ -1241,13 +386,25 @@ async def audio_websocket(ws: WebSocket):
     route_dedupe = {"text": "", "ts": 0.0}
     timer_set_dedupe = {"key": "", "ts": 0.0}
     context_turn_dedupe = {"key": "", "ts": 0.0}
+    transcript_ui_dedupe = {"key": "", "ts": 0.0}
     user_activity = {"last_user_ts": time.monotonic()}
     speech_window_state = {"last_recognizing_ts": 0.0, "utterance_start_ts": 0.0}
+    default_transport_mode = "public"
+    if MORNING_BRIEFING is not None:
+        try:
+            default_transport_mode = MORNING_BRIEFING.get_default_transport_mode()
+        except Exception:
+            default_transport_mode = "public"
     briefing_state = {
         "wake_sent_date": "",
         "test_wake_sent": False,
-        "leaving_sent_date": "",
-        "last_leaving_check_ts": 0.0,
+        "leave_home_sent_date": "",
+        "leave_office_sent_date": "",
+        "last_leave_home_check_ts": 0.0,
+        "last_leave_office_check_ts": 0.0,
+        "awaiting_transport_choice": False,
+        "selected_transport": default_transport_mode,
+        "transport_choice_date": "",
     }
     transit_turn_gate = {"until": 0.0}
     speech_capture_gate = {"until": 0.0}
@@ -1331,6 +488,29 @@ async def audio_websocket(ws: WebSocket):
         fut.add_done_callback(_done_callback)
         return fut
 
+    def _queue_transcript_event(role: str, text: str):
+        clean_text = str(text or "").strip()
+        if not clean_text:
+            return
+        role_norm = "user" if str(role or "").strip().lower() == "user" else "ai"
+        normalized_text = re.sub(r"\s+", " ", clean_text)
+        key = f"{role_norm}:{normalized_text}"
+        now_ts = time.monotonic()
+        if (
+            key
+            and key == str(transcript_ui_dedupe.get("key") or "")
+            and (now_ts - float(transcript_ui_dedupe.get("ts") or 0.0)) < 1.2
+        ):
+            return
+        transcript_ui_dedupe["key"] = key
+        transcript_ui_dedupe["ts"] = now_ts
+
+        payload = json.dumps({"type": "transcript", "role": role_norm, "text": clean_text})
+        if loop.is_running():
+            asyncio.run_coroutine_threadsafe(ws.send_text(payload), loop)
+        else:
+            print(f"[Error] Main loop is closed. Cannot send STT: {clean_text}")
+
     async def _send_user_text_turn(user_text: str):
         session_obj = session_ref.get("obj")
         if not session_obj:
@@ -1387,12 +567,22 @@ async def audio_websocket(ws: WebSocket):
         tone: str = "neutral",
         style: str = "",
         add_followup_hint: bool = True,
+        max_chars: int = 220,
+        max_sentences: int = 5,
+        split_by_sentence: bool = False,
+        chunk_max_sentences: int = 1,
+        chunk_max_chars: int = 180,
     ):
         await proactive_service.send_proactive_announcement(
             summary_text=summary_text,
             tone=tone,
             style=style,
             add_followup_hint=add_followup_hint,
+            max_chars=max_chars,
+            max_sentences=max_sentences,
+            split_by_sentence=split_by_sentence,
+            chunk_max_sentences=chunk_max_sentences,
+            chunk_max_chars=chunk_max_chars,
         )
 
     async def _on_timer_fired(delay_sec: int):
@@ -1413,95 +603,14 @@ async def audio_websocket(ws: WebSocket):
         log=print,
     )
 
-    async def _maybe_send_wake_up_briefing(force: bool = False):
-        if MORNING_BRIEFING is None:
-            return
-        if not MORNING_BRIEFING.is_wake_up_enabled():
-            return
-        now = datetime.now(ZoneInfo("Asia/Seoul"))
-        today = now.strftime("%Y-%m-%d")
-        if (not force) and briefing_state.get("wake_sent_date") == today:
-            return
-        try:
-            payload = await asyncio.to_thread(MORNING_BRIEFING.build_wake_up_briefing)
-        except Exception as e:
-            print(f"[MorningBriefing] wake-up build failed: {e}")
-            return
-        if not isinstance(payload, dict) or not payload.get("ok"):
-            return
-        text = str(payload.get("briefing") or "").strip()
-        if not text:
-            return
-        await _send_proactive_announcement(
-            summary_text=text,
-            tone="neutral",
-            add_followup_hint=True,
-        )
-        briefing_state["wake_sent_date"] = today
-
-    async def _maybe_send_leaving_home_alert(current_gps: dict):
-        if MORNING_BRIEFING is None or not isinstance(current_gps, dict):
-            return
-        if not MORNING_BRIEFING.is_leaving_home_enabled():
-            return
-        now_mono = time.monotonic()
-        last_ts = float(briefing_state.get("last_leaving_check_ts") or 0.0)
-        if (now_mono - last_ts) < 15.0:
-            return
-        briefing_state["last_leaving_check_ts"] = now_mono
-        today = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
-        if briefing_state.get("leaving_sent_date") == today:
-            return
-        try:
-            payload = await asyncio.to_thread(MORNING_BRIEFING.build_leaving_home_alert, current_gps)
-        except Exception as e:
-            print(f"[MorningBriefing] leaving-home build failed: {e}")
-            return
-        if not isinstance(payload, dict) or (not payload.get("ok")):
-            return
-        if not bool(payload.get("triggered")):
-            return
-        text = str(payload.get("alert") or "").strip()
-        if not text:
-            return
-        await _send_proactive_announcement(
-            summary_text=text,
-            tone="neutral",
-            add_followup_hint=False,
-        )
-        briefing_state["leaving_sent_date"] = today
-
-    async def _morning_briefing_scheduler():
-        if MORNING_BRIEFING is None:
-            return
-        while True:
-            try:
-                if not MORNING_BRIEFING.is_wake_up_enabled():
-                    briefing_state["test_wake_sent"] = False
-                elif bool(MORNING_BRIEFING.is_test_mode()):
-                    if not bool(briefing_state.get("test_wake_sent")):
-                        await _maybe_send_wake_up_briefing(force=True)
-                        briefing_state["test_wake_sent"] = True
-                else:
-                    briefing_state["test_wake_sent"] = False
-                    wake_time = str(MORNING_BRIEFING.get_wake_up_time() or "07:00").strip()
-                    try:
-                        hh, mm = wake_time.split(":")
-                        wake_hh = int(hh)
-                        wake_mm = int(mm)
-                    except Exception:
-                        wake_hh, wake_mm = 7, 0
-                    now = datetime.now(ZoneInfo("Asia/Seoul"))
-                    now_total_min = now.hour * 60 + now.minute
-                    wake_total_min = wake_hh * 60 + wake_mm
-                    delta_min = now_total_min - wake_total_min
-                    if 0 <= delta_min <= 10:
-                        await _maybe_send_wake_up_briefing(force=False)
-                await asyncio.sleep(20)
-            except asyncio.CancelledError:
-                return
-            except Exception as e:
-                print(f"[MorningBriefing] scheduler error: {e}")
+    briefing_runtime = BriefingRuntimeService(
+        morning_briefing=MORNING_BRIEFING,
+        send_proactive_announcement=_send_proactive_announcement,
+        runtime_env_bool=runtime_env_utils.runtime_env_bool,
+        runtime_env_path=RUNTIME_ENV_PATH,
+        briefing_pre_ad_copy=BRIEFING_PRE_AD_COPY,
+        log=print,
+    )
 
     async def _inject_initial_location_context():
         if client_state.get("lat") is None or client_state.get("lng") is None:
@@ -1555,6 +664,7 @@ async def audio_websocket(ws: WebSocket):
         if args.result.text:
             text = args.result.text
             print(f"[STT] {role}: {text}")
+            _queue_transcript_event(role, text)
             
             # Store for memory
             session_transcript.append(f"{role.upper()}: {text}")
@@ -1604,6 +714,22 @@ async def audio_websocket(ws: WebSocket):
                         return
                     route_dedupe["text"] = normalized_user_text
                     route_dedupe["ts"] = now_ts
+
+                    transport_pick = briefing_runtime.apply_transport_choice(briefing_state, text)
+                    if transport_pick.get("handled"):
+                        if loop.is_running():
+                            _submit_coroutine(
+                                _send_proactive_announcement(
+                                    summary_text=str(transport_pick.get("ack_text") or ""),
+                                    tone="neutral",
+                                    add_followup_hint=False,
+                                    max_chars=80,
+                                    max_sentences=2,
+                                ),
+                                label="transport_choice_ack",
+                            )
+                        if bool(transport_pick.get("should_short_circuit")):
+                            return
 
                     route = _fast_route_intent(text, active_timer=timer_service.has_active())
                     if not route:
@@ -1826,7 +952,7 @@ async def audio_websocket(ws: WebSocket):
                         live_summary = live_data.get("speechSummary") if isinstance(live_data, dict) else None
                         # Strict fail-closed behavior for API-backed intents:
                         # if data is unavailable, do not provide alternative guidance.
-                        api_backed_intents = {"subway_route", "bus_route", "commute_overview", "weather", "air_quality", "news"}
+                        api_backed_intents = {"subway_route", "bus_route", "commute_overview", "weather", "air_quality", "restaurant", "news"}
                         if intent in api_backed_intents:
                             if not isinstance(live_data, dict):
                                 live_summary = "현재 요청하신 정보를 받을 수 없습니다."
@@ -1921,14 +1047,6 @@ async def audio_websocket(ws: WebSocket):
                 except Exception as e:
                     print(f"[SeoulInfo] dynamic context build failed: {e}")
             
-            payload = json.dumps({"type": "transcript", "role": role, "text": text})
-            
-            # [Fix 1] Robust Loop Handling
-            if loop.is_running():
-                asyncio.run_coroutine_threadsafe(ws.send_text(payload), loop)
-            else:
-                print(f"[Error] Main loop is closed. Cannot send STT: {text}")
-
     def on_recognizing(args, role):
         if role != "user":
             return
@@ -2000,8 +1118,16 @@ async def audio_websocket(ws: WebSocket):
                                         if moved_m is None or moved_m >= 80:
                                             asyncio.create_task(_preload_env_cache(force=False))
                                         asyncio.create_task(
-                                            _maybe_send_leaving_home_alert(
-                                                {"lat": new_lat, "lng": new_lng}
+                                            briefing_runtime.maybe_send_leaving_home_alert(
+                                                briefing_state=briefing_state,
+                                                current_gps={"lat": new_lat, "lng": new_lng},
+                                            )
+                                        )
+                                        asyncio.create_task(
+                                            briefing_runtime.maybe_send_evening_local_alert(
+                                                briefing_state=briefing_state,
+                                                current_gps={"lat": new_lat, "lng": new_lng},
+                                                moved_m=moved_m,
                                             )
                                         )
                                 elif isinstance(payload, dict) and payload.get("type") == "camera_state":
@@ -2192,7 +1318,7 @@ async def audio_websocket(ws: WebSocket):
                 asyncio.create_task(smart_flush_injector()),
             ]
             if MORNING_BRIEFING is not None:
-                tasks.append(asyncio.create_task(_morning_briefing_scheduler()))
+                tasks.append(asyncio.create_task(briefing_runtime.scheduler_loop(briefing_state)))
             done, pending = await asyncio.wait(
                 tasks,
                 return_when=asyncio.FIRST_COMPLETED
@@ -2231,63 +1357,15 @@ async def audio_websocket(ws: WebSocket):
             else:
                 print("[Memory] Skipped saving: Summary is empty or invalid.")
 
-# --- Seoul Info Module Endpoint ---
-@app.post("/api/seoul-info/normalize")
-async def normalize_seoul_info(payload: dict = Body(...)):
-    voice_payload = payload.get("voicePayload")
-    odsay_payload = payload.get("odsayPayload")
-
-    packet = build_seoul_info_packet(voice_payload, odsay_payload)
-    speech_summary = build_speech_summary(packet)
-
-    return {
-        "packet": packet,
-        "speechSummary": speech_summary
-    }
-
-
-@app.get("/api/seoul-info/live")
-async def get_live_seoul_info(
-    lat: float | None = Query(default=None),
-    lng: float | None = Query(default=None),
-    station: str | None = Query(default=None),
-    destination: str | None = Query(default=None),
-):
-    data = _build_live_seoul_summary(
-        lat=lat,
-        lng=lng,
-        station_name=station,
-        destination_name=destination,
+app.include_router(
+    create_api_router(
+        build_live_seoul_summary=_build_live_seoul_summary,
+        to_float=_to_float,
+        morning_briefing=MORNING_BRIEFING,
+        build_seoul_info_packet=build_seoul_info_packet,
+        build_speech_summary=build_speech_summary,
     )
-    return data
-
-
-@app.get("/api/briefing/wake-up")
-async def get_wake_up_briefing():
-    if MORNING_BRIEFING is None:
-        return {"ok": False, "error": "morning briefing module unavailable"}
-    if not MORNING_BRIEFING.is_briefing_api_enabled():
-        return {"ok": False, "error": "briefing api disabled"}
-    if not MORNING_BRIEFING.is_wake_up_enabled():
-        return {"ok": False, "error": "wake-up briefing disabled"}
-    return await asyncio.to_thread(MORNING_BRIEFING.build_wake_up_briefing)
-
-
-@app.post("/api/briefing/leaving-home")
-async def get_leaving_home_alert(payload: dict = Body(...)):
-    if MORNING_BRIEFING is None:
-        return {"ok": False, "error": "morning briefing module unavailable"}
-    if not MORNING_BRIEFING.is_briefing_api_enabled():
-        return {"ok": False, "error": "briefing api disabled"}
-    if not MORNING_BRIEFING.is_leaving_home_enabled():
-        return {"ok": False, "error": "leaving-home briefing disabled"}
-    current_gps = payload.get("current_gps") if isinstance(payload, dict) else None
-    if not isinstance(current_gps, dict):
-        lat = _to_float(payload.get("lat")) if isinstance(payload, dict) else None
-        lng = _to_float(payload.get("lng")) if isinstance(payload, dict) else None
-        if lat is not None and lng is not None:
-            current_gps = {"lat": lat, "lng": lng}
-    return await asyncio.to_thread(MORNING_BRIEFING.build_leaving_home_alert, current_gps)
+)
 
 # --- Static Files (Frontend) ---
 FRONTEND_BUILD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "temp_front", "out")

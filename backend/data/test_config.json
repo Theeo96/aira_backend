@@ -1,27 +1,198 @@
 {
-  "mock_time": "2026-02-19 07:00:00",
-  "mock_home": {
-    "lat": 37.5665,
-    "lng": 126.978
+  "schema_version": "2026-02-20.v2",
+  "test_control": {
+    "auto_wake_up": true,
+    "description": "API 또는 위치 이벤트로 시나리오를 개별 테스트합니다."
   },
-  "mock_office": {
-    "lat": 37.5729,
-    "lng": 126.9794
+  "wake_up": {
+    "mock_now": "2026-02-20T07:00:00+09:00",
+    "alarm_time": "07:00",
+    "home": {
+      "name": "서울 마포구 공덕동",
+      "lat": 37.548313,
+      "lng": 126.956157
+    },
+    "office": {
+      "name": "서울 종로구 광화문",
+      "lat": 37.5725,
+      "lng": 126.97688
+    },
+    "weather": {
+      "temperature": 4,
+      "condition_code": 61,
+      "precipitation_probability": 80,
+      "rain_mm": 0.8,
+      "today_max": 8,
+      "today_min": 2
+    },
+    "transit_info": {
+      "estimated_minutes": 38,
+      "provider": "mock_tmap",
+      "first_mode": "subway",
+      "subway_line": "5호선",
+      "boarding_station": "공덕"
+    },
+    "car_info": {
+      "estimated_minutes": 52,
+      "provider": "mock_tmap_car"
+    },
+    "recommended_transport": "public",
+    "recommendation_reason": "대중교통 38분, 자가용 52분으로 대중교통이 더 빠릅니다.",
+    "home_district": "마포구",
+    "interest_news": [
+      {
+        "title": "한국은행, 기준금리 동결 기조 유지",
+        "link": "https://news.example.com/economy/rate-hold",
+        "pubDate": "2026-02-20T06:10:00+09:00"
+      },
+      {
+        "title": "국내 AI 반도체 투자 확대 발표",
+        "link": "https://news.example.com/tech/ai-chip-investment",
+        "pubDate": "2026-02-20T05:55:00+09:00"
+      }
+    ],
+    "local_events": [
+      {
+        "title": "경의선숲길 아침 플리마켓",
+        "date": "2026-02-20 10:00~14:00",
+        "place": "연남동 경의선숲길"
+      }
+    ],
+    "local_news": [
+      {
+        "title": "마포구청 앞 일부 차로 배수 공사로 통제"
+      }
+    ]
   },
-  "mock_location": {
-    "lat": 37.567,
-    "lng": 126.9785
+  "leave_home": {
+    "mock_now": "2026-02-20T07:33:00+09:00",
+    "home": {
+      "name": "서울 마포구 공덕동",
+      "lat": 37.548313,
+      "lng": 126.956157
+    },
+    "office": {
+      "name": "서울 종로구 광화문",
+      "lat": 37.5725,
+      "lng": 126.97688
+    },
+    "current_gps": {
+      "lat": 37.54932,
+      "lng": 126.95693
+    },
+    "distance_from_anchor_m": 123,
+    "selected_transport": "public",
+    "destination_weather": {
+      "temperature": 6,
+      "condition_code": 61,
+      "precipitation_probability": 70,
+      "rain_mm": 0.5,
+      "today_max": 8,
+      "today_min": 2
+    },
+    "transit_info": {
+      "estimated_minutes": 35,
+      "provider": "mock_tmap",
+      "first_mode": "subway",
+      "subway_line": "5호선",
+      "boarding_station": "공덕",
+      "arrival_info": "공덕역 5호선 하행 열차는 약 3분 후 도착 예정입니다."
+    },
+    "car_info": {
+      "estimated_minutes": 49,
+      "provider": "mock_tmap_car",
+      "traffic_note": "세종대로 집회 구간 우회 시 약 49분이 예상됩니다."
+    },
+    "traffic_incidents": [
+      {
+        "summary": "세종대로 일부 구간 집회로 차량 정체가 지속되고 있습니다."
+      }
+    ],
+    "poi_congestion": {
+      "label": "혼잡"
+    },
+    "local_district": "마포구",
+    "interest_news": [
+      {
+        "title": "서울시, 출근시간 혼잡 노선 증편 검토",
+        "link": "https://news.example.com/seoul/transit-boost",
+        "pubDate": "2026-02-20T07:00:00+09:00"
+      }
+    ],
+    "local_events": [
+      {
+        "title": "홍대입구 버스킹 특별공연",
+        "date": "2026-02-20 18:30",
+        "place": "홍대 걷고싶은거리"
+      }
+    ],
+    "local_news": [
+      {
+        "title": "마포대교 북단 보수 공사로 일부 구간 서행"
+      }
+    ]
   },
-  "mock_weather": {
-    "temperature": 3,
-    "condition": "rain",
-    "precipitation_probability": 90
-  },
-  "mock_incidents": [
-    {
-      "type": "집회",
-      "location": "광화문 인근",
-      "severity": "high"
-    }
-  ]
+  "leave_office": {
+    "mock_now": "2026-02-20T18:22:00+09:00",
+    "window_start_hour": 18,
+    "window_end_hour": 19,
+    "home": {
+      "name": "서울 마포구 공덕동",
+      "lat": 37.548313,
+      "lng": 126.956157
+    },
+    "office": {
+      "name": "서울 종로구 광화문",
+      "lat": 37.5725,
+      "lng": 126.97688
+    },
+    "current_gps": {
+      "lat": 37.57164,
+      "lng": 126.97803
+    },
+    "distance_from_anchor_m": 96,
+    "selected_transport": "public",
+    "destination_weather": {
+      "temperature": 5,
+      "condition_code": 3,
+      "precipitation_probability": 20,
+      "rain_mm": 0.0,
+      "today_max": 8,
+      "today_min": 2
+    },
+    "transit_info": {
+      "estimated_minutes": 41,
+      "provider": "mock_tmap",
+      "first_mode": "subway",
+      "subway_line": "5호선",
+      "boarding_station": "광화문",
+      "arrival_info": "광화문역 5호선 상행 열차는 약 2분 후 도착 예정입니다."
+    },
+    "car_info": {
+      "estimated_minutes": 58,
+      "provider": "mock_tmap_car",
+      "traffic_note": "퇴근 혼잡으로 내부순환로 진입 전 정체가 길어지고 있습니다."
+    },
+    "traffic_incidents": [
+      {
+        "summary": "종로 일대 퇴근시간 차량 증가로 평균 속도 저하"
+      }
+    ],
+    "poi_congestion": {
+      "label": "매우 혼잡"
+    },
+    "local_district": "종로구",
+    "local_events": [
+      {
+        "title": "광화문 야외 미디어아트 상영",
+        "date": "2026-02-20 19:00",
+        "place": "광화문광장"
+      }
+    ],
+    "local_news": [
+      {
+        "title": "종로구청 앞 행사 준비로 보행 동선 일부 변경"
+      }
+    ]
+  }
 }
