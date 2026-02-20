@@ -25,8 +25,6 @@ from modules.cosmos_db import cosmos_service
 from modules.memory import memory_service
 from modules.seoul_info_module import build_seoul_info_packet, build_speech_summary
 from modules.news_agent import NewsAgent
-from modules.gmail_alert_module import GmailAlertModule
-from modules.gmail_alert_runner import run_gmail_alert_loop
 from modules.intent_router import IntentRouter
 from modules.seoul_live_service import SeoulLiveService
 from modules.vision_service import VisionService
@@ -34,6 +32,7 @@ from modules.news_context_service import NewsContextService
 from modules.timer_service import TimerService
 from modules.proactive_service import ProactiveService
 from modules.ws_orchestrator_service import WsOrchestratorService
+from modules.morning_briefing_module import MorningBriefingModule
 
 from contextlib import asynccontextmanager
 
@@ -70,6 +69,7 @@ AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
 AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
 SEOUL_API_KEY = os.getenv("SEOUL_API_KEY") or os.getenv("Seoul_API")
 ODSAY_API_KEY = os.getenv("ODSAY_API_KEY")
+TMAP_APP_KEY = os.getenv("TMAP_APP_KEY")
 HOME_LAT = os.getenv("HOME_LAT")
 HOME_LNG = os.getenv("HOME_LNG")
 COMMUTE_DEFAULT_DESTINATION = os.getenv("COMMUTE_DEFAULT_DESTINATION", "광화문")
@@ -84,10 +84,6 @@ AI_STT_SEGMENTATION_SILENCE_TIMEOUT_MS = os.getenv("AI_STT_SEGMENTATION_SILENCE_
 AI_FLUSH_SILENCE_AFTER_SEC = float(os.getenv("AI_FLUSH_SILENCE_AFTER_SEC", "1.2"))
 AI_FLUSH_SILENCE_SEC = float(os.getenv("AI_FLUSH_SILENCE_SEC", "0.15"))
 AI_FLUSH_MIN_INTERVAL_SEC = float(os.getenv("AI_FLUSH_MIN_INTERVAL_SEC", "1.5"))
-GMAIL_POLL_INTERVAL_SEC = float(os.getenv("GMAIL_POLL_INTERVAL_SEC", "60"))
-GMAIL_ALERT_BIND_USER = os.getenv("GMAIL_ALERT_BIND_USER", "true").strip().lower() in {"1", "true", "yes", "on"}
-GMAIL_IDLE_TIMEOUT_SEC = float(os.getenv("GMAIL_IDLE_TIMEOUT_SEC", "120"))
-GMAIL_LIVE_POLL_FALLBACK_SEC = float(os.getenv("GMAIL_LIVE_POLL_FALLBACK_SEC", "20"))
 print(f"[Config] ENABLE_TRANSIT_FILLER={ENABLE_TRANSIT_FILLER}")
 print(f"[Config] GEMINI_DIRECT_AUDIO_INPUT={GEMINI_DIRECT_AUDIO_INPUT}")
 print(f"[Config] ORCHESTRATION_SINGLE_PATH={ORCHESTRATION_SINGLE_PATH}")
@@ -99,14 +95,14 @@ except Exception as e:
     NEWS_AGENT = None
     print(f"[News] NewsAgent init failed: {e}")
 
+try:
+    MORNING_BRIEFING = MorningBriefingModule(news_agent=NEWS_AGENT, log=print)
+except Exception as e:
+    MORNING_BRIEFING = None
+    print(f"[MorningBriefing] init failed: {e}")
+
 news_context_service = NewsContextService(news_agent=NEWS_AGENT, log=print)
 ws_orchestrator = WsOrchestratorService()
-
-try:
-    GMAIL_ALERT = GmailAlertModule()
-except Exception as e:
-    GMAIL_ALERT = None
-    print(f"[GmailAlert] init failed: {e}")
 
 
 intent_router = None
@@ -120,6 +116,17 @@ def _now_kst_text():
 def _http_get_json(url: str, timeout: int = 6):
     try:
         req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+            return json.loads(body)
+    except Exception as e:
+        print(f"[SeoulInfo] HTTP error: {e}")
+        return None
+
+
+def _http_get_json_with_headers(url: str, headers: dict | None = None, timeout: int = 6):
+    try:
+        req = urllib.request.Request(url, method="GET", headers=headers or {})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read().decode("utf-8", errors="ignore")
             return json.loads(body)
@@ -243,6 +250,16 @@ def _is_vision_followup_utterance(text: str) -> bool:
         "어때", "맞아", "아니", "들고", "보여", "보이나", "잘안",
     ]
     return any(h in t for h in hints)
+
+
+def _is_congestion_query(text: str) -> bool:
+    t = str(text or "").lower()
+    if not t:
+        return False
+    keys = [
+        "혼잡", "붐", "여유", "덜 붐비", "칸", "인파", "crowd", "congestion",
+    ]
+    return any(k in t for k in keys)
 
 
 def _normalize_place_name(name: str | None) -> str:
@@ -481,6 +498,103 @@ def _get_subway_arrival(station_name: str):
 
     rows = data.get("realtimeArrivalList", [])
     return rows if isinstance(rows, list) else []
+
+
+def _weekday_to_tmap_dow(dt: datetime) -> int:
+    # Tmap subway congestion uses 1~7, Monday=1.
+    return int(dt.weekday()) + 1
+
+
+def _normalize_route_name_for_tmap(line_text: str | None) -> str | None:
+    s = str(line_text or "").strip()
+    if not s:
+        return None
+    m = re.search(r"(\d+)\s*호선", s)
+    if m:
+        return f"{m.group(1)}호선"
+    m2 = re.search(r"(\d+)\s*line", s, flags=re.IGNORECASE)
+    if m2:
+        return f"{m2.group(1)}호선"
+    return s
+
+
+def _extract_tmap_congestion_rows(payload: dict | None) -> list[dict]:
+    if not isinstance(payload, dict):
+        return []
+
+    rows = []
+    # Common wrappers seen across SK open APIs.
+    for key in ("data", "result", "contents", "response", "body"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            rows.extend([x for x in value if isinstance(x, dict)])
+        elif isinstance(value, dict):
+            for inner in ("data", "list", "items", "cars", "car", "contents"):
+                v2 = value.get(inner)
+                if isinstance(v2, list):
+                    rows.extend([x for x in v2 if isinstance(x, dict)])
+
+    # Fallback: payload itself might already represent a row-ish object list under unknown key.
+    if not rows:
+        for _, value in payload.items():
+            if isinstance(value, list) and value and isinstance(value[0], dict):
+                rows.extend([x for x in value if isinstance(x, dict)])
+
+    # Normalize car/score fields.
+    normalized = []
+    for row in rows:
+        car_no = None
+        for ck in ("carNo", "carNum", "car_number", "car"):
+            raw = row.get(ck)
+            if raw is not None:
+                car_no = str(raw).strip()
+                break
+        score = None
+        for sk in ("score", "congestion", "congestionScore", "crowd", "value"):
+            raw = row.get(sk)
+            if raw is not None:
+                score = _to_float(raw)
+                if score is not None:
+                    break
+        if car_no and score is not None:
+            normalized.append({"car": car_no, "score": score, "raw": row})
+    return normalized
+
+
+def _get_tmap_subway_car_congestion(route_name: str | None, station_name: str | None):
+    if not TMAP_APP_KEY:
+        return None
+    route_nm = _normalize_route_name_for_tmap(route_name)
+    station_nm = str(station_name or "").strip()
+    if not route_nm or not station_nm:
+        return None
+
+    now = datetime.now(ZoneInfo("Asia/Seoul"))
+    query = urllib.parse.urlencode(
+        {
+            "routeNm": route_nm,
+            "stationNm": station_nm,
+            "dow": _weekday_to_tmap_dow(now),
+            "hh": now.hour,
+        }
+    )
+    url = f"https://apis.openapi.sk.com/transit/puzzle/subway/congestion/stat/car?{query}"
+    data = _http_get_json_with_headers(
+        url,
+        headers={"appKey": TMAP_APP_KEY, "accept": "application/json"},
+        timeout=6,
+    )
+    rows = _extract_tmap_congestion_rows(data)
+    if not rows:
+        return None
+    least = min(rows, key=lambda x: float(x.get("score") or 9999.0))
+    return {
+        "routeNm": route_nm,
+        "stationNm": station_nm,
+        "leastCar": least.get("car"),
+        "leastScore": least.get("score"),
+        "cars": rows,
+    }
 
 
 def _get_odsay_path(sx: float, sy: float, ex: float, ey: float, search_path_type: int = 0):
@@ -739,8 +853,14 @@ def _build_live_seoul_summary(
     subway_line = strategy.get("subwayLine")
     bus_numbers = strategy.get("busNumbers") or []
     subway_legs = strategy.get("subwayLegs") or []
+    subway_congestion = None
 
     departure_station = first_board if first_mode == "subway" and first_board else station
+    if first_mode == "subway":
+        subway_congestion = _get_tmap_subway_car_congestion(
+            route_name=subway_line,
+            station_name=departure_station,
+        )
     arrivals = _get_subway_arrival(departure_station) if departure_station else []
     rows = [r for r in arrivals if isinstance(r, dict)]
     rows.sort(key=lambda r: str(r.get("ordkey", "")))
@@ -814,6 +934,10 @@ def _build_live_seoul_summary(
                 parts.append("현재 이동 시간 기준으로 이번/다음 열차 모두 어렵습니다. 역 도착 후 다음 열차 시간을 다시 확인해 주세요.")
             elif decision == "first":
                 parts.append("지금 출발하면 이번 열차 탑승 가능성이 있어요.")
+            if isinstance(subway_congestion, dict):
+                least_car = str(subway_congestion.get("leastCar") or "").strip()
+                if least_car:
+                    parts.append(f"혼잡도 기준으로는 {least_car}칸이 가장 여유로운 편입니다.")
 
             if detailed_subway and subway_legs:
                 first_leg = subway_legs[0]
@@ -858,6 +982,10 @@ def _build_live_seoul_summary(
             parts.append("지금 이동하면 이번/다음 열차 모두 어렵습니다. 역 도착 후 다음 열차 시간을 다시 확인해 주세요.")
         elif decision == "first":
             parts.append("지금 출발하면 이번 열차 탑승 가능성이 있어요.")
+        if isinstance(subway_congestion, dict):
+            least_car = str(subway_congestion.get("leastCar") or "").strip()
+            if least_car:
+                parts.append(f"혼잡도 기준으로는 {least_car}칸이 가장 여유로운 편입니다.")
 
         if detailed_subway and subway_legs:
             first_leg = subway_legs[0]
@@ -896,6 +1024,7 @@ def _build_live_seoul_summary(
         "busNumbers": bus_numbers,
         "firstMode": first_mode,
         "firstDirection": first_direction,
+        "subwayCongestion": subway_congestion,
         "weather": weather,
         "air": air,
         "homeConfigured": target_lat is not None and target_lng is not None,
@@ -1111,7 +1240,15 @@ async def audio_websocket(ws: WebSocket):
     session_transcript = []
     route_dedupe = {"text": "", "ts": 0.0}
     timer_set_dedupe = {"key": "", "ts": 0.0}
+    context_turn_dedupe = {"key": "", "ts": 0.0}
     user_activity = {"last_user_ts": time.monotonic()}
+    speech_window_state = {"last_recognizing_ts": 0.0, "utterance_start_ts": 0.0}
+    briefing_state = {
+        "wake_sent_date": "",
+        "test_wake_sent": False,
+        "leaving_sent_date": "",
+        "last_leaving_check_ts": 0.0,
+    }
     transit_turn_gate = {"until": 0.0}
     speech_capture_gate = {"until": 0.0}
     response_guard = {
@@ -1276,6 +1413,96 @@ async def audio_websocket(ws: WebSocket):
         log=print,
     )
 
+    async def _maybe_send_wake_up_briefing(force: bool = False):
+        if MORNING_BRIEFING is None:
+            return
+        if not MORNING_BRIEFING.is_wake_up_enabled():
+            return
+        now = datetime.now(ZoneInfo("Asia/Seoul"))
+        today = now.strftime("%Y-%m-%d")
+        if (not force) and briefing_state.get("wake_sent_date") == today:
+            return
+        try:
+            payload = await asyncio.to_thread(MORNING_BRIEFING.build_wake_up_briefing)
+        except Exception as e:
+            print(f"[MorningBriefing] wake-up build failed: {e}")
+            return
+        if not isinstance(payload, dict) or not payload.get("ok"):
+            return
+        text = str(payload.get("briefing") or "").strip()
+        if not text:
+            return
+        await _send_proactive_announcement(
+            summary_text=text,
+            tone="neutral",
+            add_followup_hint=True,
+        )
+        briefing_state["wake_sent_date"] = today
+
+    async def _maybe_send_leaving_home_alert(current_gps: dict):
+        if MORNING_BRIEFING is None or not isinstance(current_gps, dict):
+            return
+        if not MORNING_BRIEFING.is_leaving_home_enabled():
+            return
+        now_mono = time.monotonic()
+        last_ts = float(briefing_state.get("last_leaving_check_ts") or 0.0)
+        if (now_mono - last_ts) < 15.0:
+            return
+        briefing_state["last_leaving_check_ts"] = now_mono
+        today = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
+        if briefing_state.get("leaving_sent_date") == today:
+            return
+        try:
+            payload = await asyncio.to_thread(MORNING_BRIEFING.build_leaving_home_alert, current_gps)
+        except Exception as e:
+            print(f"[MorningBriefing] leaving-home build failed: {e}")
+            return
+        if not isinstance(payload, dict) or (not payload.get("ok")):
+            return
+        if not bool(payload.get("triggered")):
+            return
+        text = str(payload.get("alert") or "").strip()
+        if not text:
+            return
+        await _send_proactive_announcement(
+            summary_text=text,
+            tone="neutral",
+            add_followup_hint=False,
+        )
+        briefing_state["leaving_sent_date"] = today
+
+    async def _morning_briefing_scheduler():
+        if MORNING_BRIEFING is None:
+            return
+        while True:
+            try:
+                if not MORNING_BRIEFING.is_wake_up_enabled():
+                    briefing_state["test_wake_sent"] = False
+                elif bool(MORNING_BRIEFING.is_test_mode()):
+                    if not bool(briefing_state.get("test_wake_sent")):
+                        await _maybe_send_wake_up_briefing(force=True)
+                        briefing_state["test_wake_sent"] = True
+                else:
+                    briefing_state["test_wake_sent"] = False
+                    wake_time = str(MORNING_BRIEFING.get_wake_up_time() or "07:00").strip()
+                    try:
+                        hh, mm = wake_time.split(":")
+                        wake_hh = int(hh)
+                        wake_mm = int(mm)
+                    except Exception:
+                        wake_hh, wake_mm = 7, 0
+                    now = datetime.now(ZoneInfo("Asia/Seoul"))
+                    now_total_min = now.hour * 60 + now.minute
+                    wake_total_min = wake_hh * 60 + wake_mm
+                    delta_min = now_total_min - wake_total_min
+                    if 0 <= delta_min <= 10:
+                        await _maybe_send_wake_up_briefing(force=False)
+                await asyncio.sleep(20)
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                print(f"[MorningBriefing] scheduler error: {e}")
+
     async def _inject_initial_location_context():
         if client_state.get("lat") is None or client_state.get("lng") is None:
             return
@@ -1339,28 +1566,28 @@ async def audio_websocket(ws: WebSocket):
                         float(speech_capture_gate.get("until") or 0.0),
                         time.monotonic() + 1.0,
                     )
-                    now_text = _now_kst_text()
-                    if loop.is_running():
-                        asyncio.run_coroutine_threadsafe(
-                            _inject_live_context_now(
-                                f"[INTENT:time_context] Current Seoul time is {now_text} (KST, Asia/Seoul). Use this as 'now'.",
-                                complete_turn=False,
-                            ),
-                            loop,
-                        )
 
                     normalized_user_text = re.sub(r"[\s\W_]+", "", str(text or ""))
                     now_ts = time.monotonic()
+                    utterance_start_ts = float(speech_window_state.get("utterance_start_ts") or 0.0)
+                    if utterance_start_ts <= 0:
+                        utterance_start_ts = max(0.0, now_ts - 2.0)
 
                     camera_on = bool(vision_service.camera_state.get("enabled", False))
                     explicit_vision = _is_vision_related_query(text)
                     inferred_vision = camera_on and _is_vision_followup_utterance(text)
                     is_vision_query = explicit_vision or inferred_vision
                     snapshot_bytes = (
-                        vision_service.get_recent_snapshot(max_age_sec=12.0)
+                        vision_service.get_snapshot_for_speech_window(
+                            utterance_start_ts=utterance_start_ts,
+                            utterance_end_ts=now_ts,
+                            pre_roll_sec=2.0,
+                            max_age_sec=12.0,
+                        )
                         if camera_on
                         else None
                     )
+                    speech_window_state["utterance_start_ts"] = 0.0
                     if is_vision_query and snapshot_bytes and loop.is_running():
                         _submit_coroutine(
                             _send_user_text_with_snapshot_turn(text, snapshot_bytes),
@@ -1597,6 +1824,21 @@ async def audio_websocket(ws: WebSocket):
                                 user_text=text,
                             )
                         live_summary = live_data.get("speechSummary") if isinstance(live_data, dict) else None
+                        # Strict fail-closed behavior for API-backed intents:
+                        # if data is unavailable, do not provide alternative guidance.
+                        api_backed_intents = {"subway_route", "bus_route", "commute_overview", "weather", "air_quality", "news"}
+                        if intent in api_backed_intents:
+                            if not isinstance(live_data, dict):
+                                live_summary = "현재 요청하신 정보를 받을 수 없습니다."
+                            elif not str(live_data.get("speechSummary") or "").strip():
+                                live_summary = "현재 요청하신 정보를 받을 수 없습니다."
+
+                        # If user asked congestion specifically, do not fallback to route guidance.
+                        if intent in {"subway_route", "commute_overview"} and _is_congestion_query(text):
+                            cong = live_data.get("subwayCongestion") if isinstance(live_data, dict) else None
+                            least_car = str(cong.get("leastCar") or "").strip() if isinstance(cong, dict) else ""
+                            if not least_car:
+                                live_summary = "현재 지하철 혼잡도 정보를 받을 수 없습니다."
                         if intent == "news":
                             news_meta = live_data.get("news") if isinstance(live_data, dict) else None
                             if isinstance(news_meta, dict):
@@ -1631,13 +1873,7 @@ async def audio_websocket(ws: WebSocket):
                                 guidance.append("Destination still missing; do not repeat destination question.")
 
                         if not live_summary:
-                            if client_state.get("lat") is not None and client_state.get("lng") is not None:
-                                live_summary = (
-                                    "현재 위치 좌표는 이미 수신되어 있어요. "
-                                    "목적지만 확인되면 경로를 바로 계산할 수 있어요."
-                                )
-                            else:
-                                live_summary = "경로 계산에 필요한 위치 좌표가 없습니다."
+                            live_summary = "현재 요청하신 정보를 받을 수 없습니다."
 
                         context_priority_intents = ws_orchestrator.CONTEXT_PRIORITY_INTENTS
                         context_summary = ws_orchestrator.merge_context_summary(
@@ -1651,6 +1887,19 @@ async def audio_websocket(ws: WebSocket):
                             ws_orchestrator.extend_post_context_gate(transit_turn_gate)
 
                         if loop.is_running():
+                            # Suppress near-duplicate context turns generated by STT split finalization.
+                            normalized_summary = re.sub(r"\s+", " ", str(context_summary or "")).strip()[:220]
+                            dedupe_key = f"{intent}|{normalized_summary}"
+                            now_ctx_ts = time.monotonic()
+                            if (
+                                dedupe_key
+                                and dedupe_key == str(context_turn_dedupe.get("key") or "")
+                                and (now_ctx_ts - float(context_turn_dedupe.get("ts") or 0.0)) < 8.0
+                            ):
+                                print(f"[Guard] duplicate context turn skipped: intent={intent}")
+                                return
+                            context_turn_dedupe["key"] = dedupe_key
+                            context_turn_dedupe["ts"] = now_ctx_ts
                             response_guard["pending_intent"] = (intent or "commute_overview")
                             response_guard["pending_context_summary"] = context_summary
                             response_guard["pending_action_instruction"] = action_instruction
@@ -1688,6 +1937,10 @@ async def audio_websocket(ws: WebSocket):
             return
         now_ts = time.monotonic()
         user_activity["last_user_ts"] = now_ts
+        last_ts = float(speech_window_state.get("last_recognizing_ts") or 0.0)
+        if (now_ts - last_ts) > 0.9:
+            speech_window_state["utterance_start_ts"] = now_ts
+        speech_window_state["last_recognizing_ts"] = now_ts
         # Gate early model audio while user speech is being finalized by STT.
         speech_capture_gate["until"] = max(float(speech_capture_gate.get("until") or 0.0), now_ts + 1.2)
         # Also hard-block direct audio briefly to avoid stale pre-context model turns.
@@ -1746,6 +1999,11 @@ async def audio_websocket(ws: WebSocket):
                                         # Refresh cached weather/air in background when movement is meaningful.
                                         if moved_m is None or moved_m >= 80:
                                             asyncio.create_task(_preload_env_cache(force=False))
+                                        asyncio.create_task(
+                                            _maybe_send_leaving_home_alert(
+                                                {"lat": new_lat, "lng": new_lng}
+                                            )
+                                        )
                                 elif isinstance(payload, dict) and payload.get("type") == "camera_state":
                                     await vision_service.set_camera_enabled(
                                         enabled=bool(payload.get("enabled")),
@@ -1933,22 +2191,8 @@ async def audio_websocket(ws: WebSocket):
                 asyncio.create_task(send_to_client()),
                 asyncio.create_task(smart_flush_injector()),
             ]
-            if GMAIL_ALERT and GMAIL_ALERT.enabled:
-                tasks.append(
-                    asyncio.create_task(
-                        run_gmail_alert_loop(
-                            gmail_alert=GMAIL_ALERT,
-                            user_id=user_id,
-                            bind_user=GMAIL_ALERT_BIND_USER,
-                            idle_timeout_sec=GMAIL_IDLE_TIMEOUT_SEC,
-                            live_poll_fallback_sec=GMAIL_LIVE_POLL_FALLBACK_SEC,
-                            user_activity=user_activity,
-                            response_guard=response_guard,
-                            send_proactive_announcement=_send_proactive_announcement,
-                            log=print,
-                        )
-                    )
-                )
+            if MORNING_BRIEFING is not None:
+                tasks.append(asyncio.create_task(_morning_briefing_scheduler()))
             done, pending = await asyncio.wait(
                 tasks,
                 return_when=asyncio.FIRST_COMPLETED
@@ -1960,11 +2204,6 @@ async def audio_websocket(ws: WebSocket):
     finally:
         # Cleanup
         session_ref["obj"] = None
-        if GMAIL_ALERT and GMAIL_ALERT.enabled:
-            try:
-                await asyncio.to_thread(GMAIL_ALERT.end_session, user_id, time.time())
-            except Exception as e:
-                print(f"[GmailAlert] end_session failed: {e}")
         print("[Server] Cleaning up resources...")
         await timer_service.shutdown()
         try:
@@ -2021,6 +2260,34 @@ async def get_live_seoul_info(
         destination_name=destination,
     )
     return data
+
+
+@app.get("/api/briefing/wake-up")
+async def get_wake_up_briefing():
+    if MORNING_BRIEFING is None:
+        return {"ok": False, "error": "morning briefing module unavailable"}
+    if not MORNING_BRIEFING.is_briefing_api_enabled():
+        return {"ok": False, "error": "briefing api disabled"}
+    if not MORNING_BRIEFING.is_wake_up_enabled():
+        return {"ok": False, "error": "wake-up briefing disabled"}
+    return await asyncio.to_thread(MORNING_BRIEFING.build_wake_up_briefing)
+
+
+@app.post("/api/briefing/leaving-home")
+async def get_leaving_home_alert(payload: dict = Body(...)):
+    if MORNING_BRIEFING is None:
+        return {"ok": False, "error": "morning briefing module unavailable"}
+    if not MORNING_BRIEFING.is_briefing_api_enabled():
+        return {"ok": False, "error": "briefing api disabled"}
+    if not MORNING_BRIEFING.is_leaving_home_enabled():
+        return {"ok": False, "error": "leaving-home briefing disabled"}
+    current_gps = payload.get("current_gps") if isinstance(payload, dict) else None
+    if not isinstance(current_gps, dict):
+        lat = _to_float(payload.get("lat")) if isinstance(payload, dict) else None
+        lng = _to_float(payload.get("lng")) if isinstance(payload, dict) else None
+        if lat is not None and lng is not None:
+            current_gps = {"lat": lat, "lng": lng}
+    return await asyncio.to_thread(MORNING_BRIEFING.build_leaving_home_alert, current_gps)
 
 # --- Static Files (Frontend) ---
 FRONTEND_BUILD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "temp_front", "out")

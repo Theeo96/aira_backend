@@ -312,18 +312,39 @@ export default function Home() {
     }
   };
 
-  const sendVisionSnapshot = () => {
+  const sendVisionSnapshot = async () => {
     const ws = websocketRef.current;
     const v = cameraVideoRef.current;
     const c = cameraCanvasRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN || !v || !c) return;
-    if (v.videoWidth === 0 || v.videoHeight === 0) return;
-
-    c.width = 640;
-    c.height = Math.max(360, Math.floor((640 * v.videoHeight) / v.videoWidth));
     const ctx = c.getContext("2d");
     if (!ctx) return;
-    ctx.drawImage(v, 0, 0, c.width, c.height);
+
+    // For browser screen-share, use track frame capture first to avoid stale first-frame issues.
+    let captured = false;
+    if (isScreenOn && screenStreamRef.current) {
+      try {
+        const [track] = screenStreamRef.current.getVideoTracks();
+        if (track && "ImageCapture" in window) {
+          const imageCapture = new (window as any).ImageCapture(track);
+          const bitmap = await imageCapture.grabFrame();
+          c.width = 640;
+          c.height = Math.max(360, Math.floor((640 * bitmap.height) / bitmap.width));
+          ctx.drawImage(bitmap, 0, 0, c.width, c.height);
+          captured = true;
+        }
+      } catch (e) {
+        console.warn("ImageCapture failed, fallback to video frame:", e);
+      }
+    }
+
+    if (!captured) {
+      if (v.videoWidth === 0 || v.videoHeight === 0) return;
+      c.width = 640;
+      c.height = Math.max(360, Math.floor((640 * v.videoHeight) / v.videoWidth));
+      ctx.drawImage(v, 0, 0, c.width, c.height);
+    }
+
     const dataUrl = c.toDataURL("image/jpeg", 0.55);
     const b64 = dataUrl.split(",")[1] || "";
     if (!b64) return;
@@ -337,12 +358,12 @@ export default function Home() {
     return true;
   };
 
-  const sendVisionSnapshotWithRetry = (attempt = 0) => {
-    const ok = sendVisionSnapshot();
+  const sendVisionSnapshotWithRetry = async (attempt = 0) => {
+    const ok = await sendVisionSnapshot();
     if (ok) return;
     if (attempt >= 20) return;
     window.setTimeout(() => {
-      sendVisionSnapshotWithRetry(attempt + 1);
+      void sendVisionSnapshotWithRetry(attempt + 1);
     }, 250);
   };
 
@@ -352,7 +373,7 @@ export default function Home() {
       visionHeartbeatTimerRef.current = null;
     }
     visionHeartbeatTimerRef.current = window.setInterval(() => {
-      sendVisionSnapshotWithRetry();
+      void sendVisionSnapshotWithRetry();
     }, 1200);
   };
 
@@ -382,7 +403,7 @@ export default function Home() {
       websocketRef.current.send(JSON.stringify({ type: "camera_state", enabled: true }));
       setIsCameraOn(true);
       setIsScreenOn(false);
-      sendVisionSnapshotWithRetry();
+      void sendVisionSnapshotWithRetry();
       startVisionHeartbeat();
     } catch (e) {
       console.error(e);
@@ -413,7 +434,7 @@ export default function Home() {
       websocketRef.current.send(JSON.stringify({ type: "camera_state", enabled: true }));
       setIsScreenOn(true);
       setIsCameraOn(false);
-      sendVisionSnapshotWithRetry();
+      void sendVisionSnapshotWithRetry();
       startVisionHeartbeat();
 
       const [track] = stream.getVideoTracks();
@@ -455,7 +476,7 @@ export default function Home() {
 
       await sendLocationUpdate(websocketRef.current);
       if (!aiSpeakingRef.current) {
-        sendVisionSnapshotWithRetry();
+        void sendVisionSnapshotWithRetry();
       }
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }

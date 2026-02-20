@@ -1,5 +1,6 @@
 import base64
 import time
+from collections import deque
 from typing import Callable
 
 
@@ -15,7 +16,18 @@ class VisionService:
             "latest_snapshot": None,
             "snapshot_ts": 0.0,
             "snapshot_updates": 0,
+            "snapshot_buffer": deque(maxlen=40),
         }
+
+    def _record_snapshot(self, image_bytes: bytes, ts: float | None = None):
+        if not image_bytes:
+            return
+        now_ts = float(ts if ts is not None else time.monotonic())
+        self.camera_state["latest_snapshot"] = bytes(image_bytes)
+        self.camera_state["snapshot_ts"] = now_ts
+        buf = self.camera_state.get("snapshot_buffer")
+        if isinstance(buf, deque):
+            buf.append({"ts": now_ts, "data": bytes(image_bytes)})
 
     async def send_frame_to_gemini(
         self,
@@ -28,8 +40,7 @@ class VisionService:
             return
         now_ts = time.monotonic()
         # Keep latest frame snapshot synced so query-time snapshot turn uses the newest view.
-        self.camera_state["latest_snapshot"] = bytes(image_bytes)
-        self.camera_state["snapshot_ts"] = now_ts
+        self._record_snapshot(image_bytes=image_bytes, ts=now_ts)
         if now_ts - float(self.camera_state.get("last_frame_ts") or 0.0) < self.min_interval_sec:
             return
         session_obj = session_ref.get("obj")
@@ -60,6 +71,9 @@ class VisionService:
         self.camera_state["latest_snapshot"] = None
         self.camera_state["snapshot_ts"] = 0.0
         self.camera_state["last_frame_ts"] = 0.0
+        buf = self.camera_state.get("snapshot_buffer")
+        if isinstance(buf, deque):
+            buf.clear()
         self.log(f"[Vision] Camera state changed: enabled={camera_on}")
         if camera_on:
             await inject_live_context_now(
@@ -91,8 +105,7 @@ class VisionService:
         if isinstance(b64, str) and b64:
             try:
                 image_bytes = base64.b64decode(b64)
-                self.camera_state["latest_snapshot"] = image_bytes
-                self.camera_state["snapshot_ts"] = time.monotonic()
+                self._record_snapshot(image_bytes=image_bytes, ts=time.monotonic())
                 self.camera_state["snapshot_updates"] = int(self.camera_state.get("snapshot_updates") or 0) + 1
                 updates = int(self.camera_state["snapshot_updates"])
                 if updates == 1 or updates % 20 == 0:
@@ -128,3 +141,30 @@ class VisionService:
         ):
             return bytes(snapshot_bytes)
         return None
+
+    def get_snapshot_for_speech_window(
+        self,
+        utterance_start_ts: float,
+        utterance_end_ts: float,
+        pre_roll_sec: float = 2.0,
+        max_age_sec: float = 12.0,
+    ) -> bytes | None:
+        start = max(0.0, float(utterance_start_ts or 0.0) - float(pre_roll_sec))
+        end = float(utterance_end_ts or 0.0)
+        now = time.monotonic()
+        buf = self.camera_state.get("snapshot_buffer")
+        if isinstance(buf, deque) and len(buf) > 0:
+            picked = None
+            for item in reversed(buf):
+                ts = float(item.get("ts") or 0.0)
+                data = item.get("data")
+                if not isinstance(data, (bytes, bytearray)):
+                    continue
+                if ts < (now - float(max_age_sec)):
+                    continue
+                if start <= ts <= end:
+                    picked = bytes(data)
+                    break
+            if picked is not None:
+                return picked
+        return self.get_recent_snapshot(max_age_sec=max_age_sec)

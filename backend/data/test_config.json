@@ -1,0 +1,27 @@
+{
+  "mock_time": "2026-02-19 07:00:00",
+  "mock_home": {
+    "lat": 37.5665,
+    "lng": 126.978
+  },
+  "mock_office": {
+    "lat": 37.5729,
+    "lng": 126.9794
+  },
+  "mock_location": {
+    "lat": 37.567,
+    "lng": 126.9785
+  },
+  "mock_weather": {
+    "temperature": 3,
+    "condition": "rain",
+    "precipitation_probability": 90
+  },
+  "mock_incidents": [
+    {
+      "type": "집회",
+      "location": "광화문 인근",
+      "severity": "high"
+    }
+  ]
+}

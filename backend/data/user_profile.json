@@ -1,0 +1,19 @@
+{
+  "wake_up_time": "07:00",
+  "home": {
+    "lat": 37.5665,
+    "lng": 126.978,
+    "name": "서울역 근처"
+  },
+  "office": {
+    "lat": 37.5729,
+    "lng": 126.9794,
+    "name": "광화문"
+  },
+  "usual_commute_minutes": 40,
+  "interest_keywords": [
+    "AI",
+    "경제",
+    "서울"
+  ]
+}
