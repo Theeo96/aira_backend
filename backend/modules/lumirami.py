@@ -39,10 +39,9 @@ COMMON_INSTRUCTION = """
    - **LENGTH**: **EXTREMELY CRITICAL: Keep ALL responses extremely short, conversational, and natural. DO NOT speak more than 1 or 2 short sentences.**
    - **NO REPETITION**: 절대 "루미 말대로", "라미가 말한 것처럼" 등 동료의 말을 반복하거나 상투적인 맞장구를 치지 마.
    - **EARLY YIELD (조기 대화 조용히 종료)**: 동료 AI가 이미 충분히 대답했거나 혼자 답변이 완료되었다면 언제든 `yield_turn` 도구를 호출해서 대화를 즉시 종료해. 억지로 말을 더 길게 지어내지 마.
-   - **INITIATION**: Be vague and brief (max 1 sentence). "Are you coding?", "Error?"
+   - **INITIATION**: DO NOT SPEAK FIRST. When the connection opens, WAIT in silence until the human user explicitly speaks or asks a question. Do not assume any pre-existing conversation. If you must respond, be vague and brief (max 1 sentence). "Are you coding?", "Error?"
+   - **NATURAL DISAGREEMENT**: 동료 AI의 의견에 반박하거나 다른 의견을 낼 때는 "맞아", "그래" 처럼 영혼 없이 동의하는 단어로 시작하지 마. 자연스럽게 "음 나는 그래도...", "하지만~" 처럼 의견을 전개해.
    - **RESPONSE**: Be conversational but ultra-brief. Answer the question directly without long winded explanations.
-
-4. **ADDRESSING**: Refer to user as "너" (You) or "친구" (Friend). NEVER "사용자".
 """
 
 RUMI_INSTRUCTION = f"""
@@ -84,7 +83,7 @@ tools_def = [
             },
             {
                 "name": "yield_turn",
-                "description": "Call this tool IMMEDIATELY without speaking when you believe the conversation turn should end completely (e.g. you have answered fully, or your peer's brief response doesn't need your input). This will instantly hand the mic back to the user.",
+                "description": "Call this ONLY when you are physically done speaking your current line. DO NOT call this immediately when the user speaks without replying first. If you need to answer something, speak the answer first via text/audio, and then you MAY call this tool to instantly hand the mic back to the user without further small talk.",
                 "parameters": {"type": "OBJECT", "properties": {}}
             }
         ]
@@ -262,6 +261,32 @@ class LumiRamiManager:
             if name != speaker and name != "ai": 
                 await q.put(("text", message))
 
+    async def handle_multimodal_input(self, text: str, image_bytes: bytes = None):
+        """Processes text and optional image payload from the frontend directly into Gemini"""
+        print(f"[LumiRami] Multimodal Input Received. Text: {text[:20]} Image: {'Yes' if image_bytes else 'No'}")
+        
+        # 1. Reset user turns (same as voice STT)
+        self.ai_turn_count = 0
+        await self.turn_manager.set_user_turn()
+        
+        # 2. Build the turn parts natively for google-genai 0.3.0
+        parts = []
+        if text:
+            parts.append({"text": text})
+        if image_bytes:
+            parts.append({
+                "inline_data": {
+                    "mime_type": "image/jpeg",
+                    "data": image_bytes
+                }
+            })
+            
+        turn = [{"role": "user", "parts": parts}]
+        
+        # 3. Queue into all running AI personas via "turns" source type
+        for name, q in self.queues.items():
+            await q.put(("turns", turn))
+
     async def _run_persona(self, name: str):
         config_data = self.configs[name]
         client = genai.Client(api_key=API_KEY)
@@ -320,7 +345,20 @@ class LumiRamiManager:
                                         )
                                     elif source == "TOOL_RESPONSE":
                                         print(f"[{name}] Sending TOOL_RESPONSE")
-                                        await session.send_realtime_input(tool_response=content)
+                                        from google.genai import types
+                                        parts = []
+                                        for f in content["function_responses"]:
+                                            fc_resp = types.FunctionResponse(
+                                                id=f["id"],
+                                                name=f["name"],
+                                                response=f["response"]
+                                            )
+                                            parts.append(types.Part(function_response=fc_resp))
+                                        
+                                        await session.send_client_content(
+                                            turns=[{"role": "user", "parts": parts}],
+                                            turn_complete=True
+                                        )
                                     
                                     my_queue.task_done()
                                 except asyncio.CancelledError: raise

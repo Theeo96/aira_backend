@@ -21,6 +21,11 @@ export default function Home() {
   const [userToken, setUserToken] = useState<string | null>(null);
   const [loginInput, setLoginInput] = useState("");
 
+  // Multimodal Input State
+  const [textInput, setTextInput] = useState("");
+  const [selectedImage, setSelectedImage] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
   const websocketRef = useRef<WebSocket | null>(null);
   const locationTimerRef = useRef<number | null>(null);
   const playbackContextRef = useRef<AudioContext | null>(null);
@@ -135,6 +140,38 @@ export default function Home() {
     if (locationTimerRef.current) {
       window.clearInterval(locationTimerRef.current);
       locationTimerRef.current = null;
+    }
+  };
+
+  const handleImageSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      setSelectedImage(event.target?.result as string);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleSendMultimodal = () => {
+    if (!textInput.trim() && !selectedImage) return;
+    if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
+      websocketRef.current.send(
+        JSON.stringify({
+          type: "multimodal_input",
+          text: textInput,
+          image_b64: selectedImage,
+        })
+      );
+      // We don't locally push text to transcript here because server will echo it back, 
+      // but if we want instant feedback we can. Let's let server echo it.
+      setTextInput("");
+      setSelectedImage(null);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+    } else {
+      alert("Aira에 먼저 연결해주세요 (Connect 버튼 클릭).");
     }
   };
 
@@ -714,6 +751,52 @@ export default function Home() {
           </div>
         ))}
         <div ref={chatBottomRef} />
+      </div>
+
+      {/* Multimodal Input Area */}
+      <div className="w-full max-w-5xl mt-4 bg-gray-900 border border-gray-800 rounded-xl p-4 flex flex-col gap-3">
+        {selectedImage && (
+          <div className="relative w-fit">
+            <img src={selectedImage} alt="preview" className="h-24 rounded-md object-cover border border-gray-700" />
+            <button
+              onClick={() => setSelectedImage(null)}
+              className="absolute -top-2 -right-2 bg-red-600 rounded-full w-6 h-6 flex items-center justify-center text-xs text-white"
+            >
+              x
+            </button>
+          </div>
+        )}
+        <div className="flex gap-2">
+          <input
+            type="file"
+            accept="image/*"
+            className="hidden"
+            ref={fileInputRef}
+            onChange={handleImageSelect}
+          />
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            className="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm transition font-bold"
+          >
+            📷 사진 첨부
+          </button>
+          <input
+            type="text"
+            className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-blue-500"
+            placeholder="텍스트 메시지 입력..."
+            value={textInput}
+            onChange={e => setTextInput(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Enter') handleSendMultimodal();
+            }}
+          />
+          <button
+            onClick={handleSendMultimodal}
+            className="px-6 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg font-bold transition"
+          >
+            전송
+          </button>
+        </div>
       </div>
     </main>
   );

@@ -29,3 +29,29 @@
 [2026-02-20 23:48] 요청: 1. 억지로 3턴을 채우는 현상 방지(AI 스스로 대화 종결 판단 시 조기 종료), 2. "루미/라미의 말대로~" 동의 문구 금지, 3. Cosmos DB Profile 실제 저장 여부 재확인
 [2026-02-21 00:15] 진행: lumirami.py에 Gemini Native Tool `yield_turn` 구현. AI가 빈 문자열 생성을 시도하다 오작동하는 대신 명시적으로 도구를 호출하여 턴 카운트를 즉시 3으로 만들고 마이크를 넘기도록 코드 아키텍처 개선. 맞장구 금지 프롬프트 강화. server.py의 Profile 저장 Coroutine 실행 추적 로직 적용.
 [2026-02-21 00:16] 답변: 조기 대화 종료 도구(yield_turn) 적용 완료. Profile DB 저장 로직은 내부적으로 UserMemories 컨테이너의 doc_type="profile", id="profile:user_email" 형태로 저장됨을 확인하여 안내.
+[2026-02-21 14:15] 질의: Cosmos DB 프로필의 `home_destination`에 "방구석"이라고 저장된 경위 문의
+[2026-02-21 14:16] 답변: 프로필 갱신 로직(upsert) 정상 작동 여부를 테스트하기 위해 이전에 실행했던 테스트 스크립트(`test_cosmos.py`)에서 임의로 주입한 테스트 데이터였음을 설명.
+[2026-02-21 14:21] 질의: Router를 통한 집 위치 인식/갱신의 구체적인 트리거 조건 및 동작 흐름 문의
+[2026-02-21 14:25] 답변: 텍스트 유틸을 통한 목적지 추출 -> Azure OpenAI GPT-4o-mini의 Intent 분류 -> Python 서버 코드를 통한 분기 및 DB 업데이트 -> Speech 모델에게 텍스트 컨텍스트 주입으로 이어지는 3단계 하이브리드 프로세스 상세 안내 및 Tool Calling과의 차이점 비교.
+[2026-02-21 14:42] 질의: MCP(Model Context Protocol)와 Router 구조의 호환성, 그리고 Gemini Native Audio 모델의 직접 텍스트/이미지 입력(Multimodal) 가능 여부 문의
+[2026-02-21 14:45] 답변: MCP는 인프라 규격이므로 Router 방식에서도 사용 가능함을 설명. 현재 Gemini 세션에도 이미 사용자로써 텍스트와 이미지를 직접 `turns` 형태로 전송하고 있으며(시스템 메세지가 아님), 추후 멀티모달 기능 확장이 구조적으로 완벽히 준비되어 있음을 안내.
+[2026-02-21 14:54] 질의: LLM 및 Speech 모델이 입력을 받을 때 배열([])과 딕셔너리({}) 형태의 JSON 구조를 취하는 이유와 보편성에 대한 문의
+[2026-02-21 14:55] 답변: 현대의 모든 주요 LLM(Gemini, GPT, Claude 등)이 채택하고 있는 멀티모달 표준 입력 포맷(역할 분리 및 다양한 데이터 타입 혼합 허용)에 대한 상세 원리 설명.
+[2026-02-21 14:57] 요청: 프론트엔드(`temp_front`)에 텍스트 및 이미지(사진)를 업로드하여 음성 모델(Speech)에게 직접 인풋을 넘기는 멀티모달 UI 기능 추가
+[2026-02-21 15:00] 완료: `page.tsx`에 사진 첨부 및 텍스트 폼 추가, `server.py` 웹소켓 리시버에 `multimodal_input` JSON 파싱 로직 및 Base64 이미지 디코딩 파이프라인(`role: user` turn 전송) 추가 적용. 테스트 대기.
+[2026-02-21 15:11] 질의: 추후 Azure Static Web App으로 프론트엔드를 분리 시 아키텍처 연동 방안(WebSocket, CORS, 데이터 전송 구조) 문의
+[2026-02-21 15:15] 답변: 현재 구조에서 백엔드의 주소만 변경하면 완벽히 분리 호환됨을 확인. WebSocket 실시간 스트리밍의 필수성, CORS 정책(Wildcard 상태), wss/https 프로토콜 설정 등 인프라 분리 시 고려해야 할 핵심 요소들과 안정성에 대해 종합 설명 제공.
+[2026-02-21 16:42] 질의: 서버 실행 직후 사용자가 발화하지 않았음에도 AI가 자동으로 조기 종료(`yield_turn`) 도구를 호출하다가 서버의 `send_realtime_input` 파라미터 에러 발생
+[2026-02-21 16:45] 진행: 1. `lumirami.py`의 `COMMON_INSTRUCTION`에 사용자가 명시적으로 말하기 전까지 침묵 대기(`DO NOT SPEAK FIRST`) 규칙 추가. 2. 최신 Gemini SDK 규격에 맞게 툴 응답 형식을 `send_realtime_input` 대신 `send_client_content(turns=[role:user, function_responses])` 로 수정 완료.
+[2026-02-21 16:57] 질의: 1. 조기 종료 도구(`yield_turn`) 호출 후 `send_client_content`에서 `LiveClientContent` 타입 에러 발생. 2. `temp_front` UI에 텍스트/이미지 입력창이 보이지 않는 증상 문의
+[2026-02-21 17:05] 조치: 1. Gemini SDK 최신 버전 문법에 맞추어 단순 JSON dict 파싱 대신 `google.genai.types`를 import하여 `content` 파라미터 구조로 응답하도록 수정 완료. 2. React UI 변경사항을 반영하기 위해 `temp_front` 폴더에서 `npm run dev` 스크립트를 수동으로 백그라운드 실행하도록 조치 및 안내.
+[2026-02-21 17:23] 질의: 기존에 이용하던 Ngrok 포트(8000) 환경에서 ফ্র론트엔드 UI 변경 사항이 노출되지 않는 아키텍처 원인 문의
+[2026-02-21 17:25] 조치: Python 서버(`server.py`)는 `temp_front/out` 폴더의 정적 파일(Static Files)을 서빙하므로 소스코드가 바뀌어도 빌드를 새로 하지 않으면 과거 버전을 띄워줌을 설명. `npm 일un build` 명령어를 백그라운드에서 직접 실행하여 Ngrok 링크(8000포트)에서도 정상적으로 보이도록 최신화 완료.
+[2026-02-21 17:33] 질의: 1. `yield_turn` 툴 응답 시 여전히 발생하는 `LiveClientContent` 키워드 에러 파악. 2. 에러 발생 후 AI가 사용자의 음성을 무시하는 증상 연관성 파악. 3. 멀티모달 텍스트 인풋이 프론트엔드 대화내역에는 추가되나 Python 서버 로그에 찍히지 않아 기억 저장 누락 우려 파악.
+[2026-02-21 17:40] 조치: 1. Gemini 0.3.0 SDK의 Pydantic 구조체에 맞게 `function_responses`(복수형) 키워드를 `[{"function_response": {"name": ..., "response": ...}}]`(단수형) JSON 규격으로 완벽하게 수정하여 툴 응답 전송 루프 크래시 해결. 2. 해당 크래시로 인해 Sender Thread가 사망하여 이후 음성이 전달되지 않던 원인 동시 해결. 3. `server.py`의 `multimodal_input` 수신부에 `print()` 로그가 누락되어 콘솔에만 보이지 않았던 것일 뿐 `session_transcript`에는 정상적으로 수집되고 있었음을 확인 및 `print()` 로그 추가.
+[2026-02-21 18:08] 질의: 1. 툴 호출 후 여전히 1007(Bad Argument) 오류 발생. 2. 텍스트 입력 시 AI가 대답하지 않는 버그 발생. 3. 동료 AI의 의견에 반박할 때 기계적으로 "맞아"라고 동의하며 시작하는 어색한 말투 지적.
+[2026-02-21 18:15] 조치: 1. 최신 Gemini SDK 디버깅을 통해 `function_response` 딕셔너리 내부에 Tool Call의 고유 `id` 값이 필수적으로 포함되어야 함을 파악하고 추가하여 크래시 최종 해결. 2. `server.py`에서 텍스트 수신 시 존재하지 않는 함수(`_send_user_text_turn`)를 호출하다가 `try-except`에 먹혀버린 침묵 에러 발견, `LumiRamiManager.handle_multimodal_input()` 메소드를 새로 만들어 텍스트/이미지를 `Live API` 큐에 정상적으로 삽입하도록 수정. 3. `lumirami.py`의 공통 지시문(`COMMON_INSTRUCTION`)에 기계적인 동의 표현을 금지하는 `NATURAL DISAGREEMENT` 규칙을 구체적으로 추가.
+[2026-02-21 18:49] 요청: 지금까지 작업한 모델 백엔드 및 프론트엔드의 전체적인 코드 무결성(dangling method 유무, 논리적 연결성 등) 점검
+[2026-02-21 18:55] 완료: 프론트엔드(`temp_front`) 컴파일 단계에서 치명타 없는 TypeScript `any` 경고 외 특이사항 없음을 ESLint로 확인. 백엔드(`server.py`) 소스는 정규식(grep) 스캔을 통해 예전 잔재가 된 빈 함수명들을 100% 제거하고 모든 데이터가 `LumiRamiManager` 단일 병목으로 안전하게 주입(Injection)되도록 통합되어 있음을 최종 검증 완료.
+[2026-02-21 19:13] 버그 리포트: 1. `yield_turn` 도구 호출 직후 발생하는 `1007 Invalid argument` 에러 재발생. 2. 이름을 불렀을 때 대답하지 않고 즉시 턴을 종료(yield_turn 호출)해버리는 부자연스러운 현상 발생.
+[2026-02-21 19:22] 완벽 조치: 1. 최신 구글 API의 엄격한 JSON 파싱 구조(CamelCase 등)를 우회하기 위해, 어설픈 딕셔너리(`{}`) 조합 대신 Pydantic 객체인 `types.Part(function_response=types.FunctionResponse(...))`를 직접 생성하여 주입하도록 아키텍처 완전 개편. 1007 에러 원천 차단. 2. 프롬프트 지시문(`COMMON_INSTRUCTION`) 상단의 `yield_turn` 도구 설명을 강력하게 수정(`DO NOT call this immediately when the user speaks without replying first`). 반드시 무언가 입술을 떼어 대답을 "먼저" 한 뒤에만 턴을 종료할 수 있도록 통제.

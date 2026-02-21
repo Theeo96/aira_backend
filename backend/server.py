@@ -1154,6 +1154,30 @@ async def audio_websocket(ws: WebSocket):
                                     session_ref=session_ref,
                                     inject_live_context_now=_inject_live_context_now,
                                 )
+                            elif isinstance(payload, dict) and payload.get("type") == "multimodal_input":
+                                input_text = payload.get("text", "")
+                                input_image = payload.get("image_b64")
+                                
+                                msg_disp = input_text
+                                if input_image:
+                                    msg_disp = "[Photo Attached] " + msg_disp
+                                _queue_transcript_event("user", msg_disp)
+                                session_transcript.append(f"USER: {msg_disp}")
+                                print(f"[Multimodal] USER: {msg_disp}")
+                                
+                                if input_image:
+                                    try:
+                                        import base64
+                                        b64_str = input_image.split(",")[-1] if "," in input_image else input_image
+                                        img_bytes = base64.b64decode(b64_str)
+                                        if loop.is_running():
+                                            _submit_coroutine(lumi_rami_manager.handle_multimodal_input(input_text, image_bytes=img_bytes), label="multimodal_img")
+                                    except Exception as e:
+                                        print(f"[Multimodal] Error parsing image: {e}")
+                                else:
+                                    if loop.is_running() and input_text:
+                                        _submit_coroutine(lumi_rami_manager.handle_multimodal_input(input_text), label="multimodal_txt")
+
                         except Exception:
                             pass
                         continue
