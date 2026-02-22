@@ -40,24 +40,40 @@ class ContextRuntimeService:
             return None
 
     def http_get_json(self, url: str, timeout: int = 6):
-        try:
-            req = urllib.request.Request(url, method="GET")
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                body = resp.read().decode("utf-8", errors="ignore")
-                return json.loads(body)
-        except Exception as e:
-            self.log(f"[SeoulInfo] HTTP error: {e}")
-            return None
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        
+        for attempt in range(3):
+            try:
+                req = urllib.request.Request(url, method="GET")
+                with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                    body = resp.read().decode("utf-8", errors="ignore")
+                    return json.loads(body)
+            except Exception as e:
+                if attempt == 2:
+                    self.log(f"[SeoulInfo] HTTP error after 3 attempts: {e}")
+                time.sleep(0.5)
+        return None
 
     def http_get_json_with_headers(self, url: str, headers: dict | None = None, timeout: int = 6):
-        try:
-            req = urllib.request.Request(url, method="GET", headers=headers or {})
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                body = resp.read().decode("utf-8", errors="ignore")
-                return json.loads(body)
-        except Exception as e:
-            self.log(f"[SeoulInfo] HTTP error: {e}")
-            return None
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        for attempt in range(3):
+            try:
+                req = urllib.request.Request(url, method="GET", headers=headers or {})
+                with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                    body = resp.read().decode("utf-8", errors="ignore")
+                    return json.loads(body)
+            except Exception as e:
+                if attempt == 2:
+                    self.log(f"[SeoulInfo] HTTP error after 3 attempts: {e}")
+                time.sleep(0.5)
+        return None
 
     def resolve_home_coords(self):
         lat = self.to_float(self.home_lat)

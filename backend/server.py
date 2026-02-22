@@ -414,8 +414,13 @@ async def audio_websocket(ws: WebSocket):
     dynamic_context_lock = asyncio.Lock()
     session_ref = {"obj": None}
     
-    # Track Full Transcript for Summarization
-    session_transcript = []
+    import uuid
+    from datetime import datetime
+    session_messages = []
+    global_seq = 0
+    conversation_id = f"c_{uuid.uuid4().hex[:8]}"
+    session_start_time = datetime.utcnow().isoformat() + "Z"
+
     route_dedupe = {"text": "", "ts": 0.0}
     timer_set_dedupe = {"key": "", "ts": 0.0}
     context_turn_dedupe = {"key": "", "ts": 0.0}
@@ -531,6 +536,22 @@ async def audio_websocket(ws: WebSocket):
             return
         transcript_ui_dedupe["key"] = key
         transcript_ui_dedupe["ts"] = now_ts
+
+        # Build message object for memory saving
+        nonlocal global_seq
+        created_at_str = datetime.utcnow().isoformat() + "Z"
+        
+        msg_obj = {
+            "message_id": f"msg_{conversation_id}_{(global_seq):03d}",
+            "conversation_id": conversation_id,
+            "seq": global_seq,
+            "speaker_type": "user" if role_norm == "user" else "ai",
+            "ai_persona": role_norm if (role_norm in ("lumi", "rami")) else None,
+            "text": clean_text,
+            "created_at": created_at_str
+        }
+        global_seq += 1
+        session_messages.append(msg_obj)
 
         payload = json.dumps({"type": "transcript", "role": role_norm, "text": clean_text})
         if loop.is_running():
@@ -683,9 +704,6 @@ async def audio_websocket(ws: WebSocket):
             text = args.result.text
             print(f"[STT] {role}: {text}")
             _queue_transcript_event(role, text)
-            
-            # Store for memory
-            session_transcript.append(f"{role.upper()}: {text}")
 
             if role == "user":
                 try:
@@ -1179,7 +1197,6 @@ async def audio_websocket(ws: WebSocket):
                                 if input_image:
                                     msg_disp = "[Photo Attached] " + msg_disp
                                 _queue_transcript_event("user", msg_disp)
-                                session_transcript.append(f"USER: {msg_disp}")
                                 print(f"[Multimodal] USER: {msg_disp}")
                                 
                                 if input_image:
@@ -1292,19 +1309,26 @@ async def audio_websocket(ws: WebSocket):
         except: pass
         print("[Server] Connection closed")
 
-        # 3. Save Memory (Summarization)
-        if session_transcript and len(session_transcript) > 2: # Don't save empty sessions
-            print("[Memory] Summarizing session (Dual)...")
-            full_text = "\n".join(session_transcript)
+        # 3. Save Memory (Unified Unified Schema)
+        if session_messages and len(session_messages) > 2: # Don't save overly short sessions
+            print("[Memory] Analyzing unified memory graph and turns...")
             
             # Blocking I/O -> Async Thread
-            summary_json = await asyncio.to_thread(memory_service.summarize_dual, full_text)
+            session_end_time = datetime.utcnow().isoformat() + "Z"
+            conversation_data = await asyncio.to_thread(
+                memory_service.analyze_unified_memory,
+                conversation_id,
+                user_id,
+                session_start_time,
+                session_end_time,
+                session_messages
+            )
             
-            if summary_json:
-                await asyncio.to_thread(cosmos_service.save_memory, user_id, full_text, summary_json)
-                print(f"[Memory] Dual Session saved for {user_id}")
+            if conversation_data:
+                await asyncio.to_thread(cosmos_service.save_memory, user_id, conversation_data)
+                print(f"[Memory] Unified Session Graph saved for {user_id} ({conversation_id})")
             else:
-                print("[Memory] Skipped saving: Summary is empty or invalid.")
+                print("[Memory] Skipped saving: unified memory analysis failed.")
 
 app.include_router(
     create_api_router(

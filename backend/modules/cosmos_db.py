@@ -36,25 +36,24 @@ class CosmosDBService:
             self.container = None
             self.users_container = None
 
-    def save_memory(self, user_id, full_transcript, summary_json):
+    def save_memory(self, user_id, conversation_data: dict):
         if not self.container: return
 
-        # Korea Time (UTC+9)
-        kst = pytz.timezone('Asia/Seoul')
-        now = datetime.now(kst).isoformat()
-
-        memory_item = {
-            "id": str(uuid.uuid4()),
-            "doc_type": "memory",
-            "user_id": user_id,
-            "date": now,
-            "full_transcript": full_transcript,
-            "summary": summary_json
-        }
+        # Ensure required fields exist in the payload
+        if "conversation_id" not in conversation_data:
+            conversation_data["conversation_id"] = str(uuid.uuid4())
+        
+        # Override or confirm user_id
+        conversation_data["user_id"] = user_id
+        conversation_data["doc_type"] = "memory"
+        
+        # Use conversation_id as Cosmos DB document 'id' if 'id' not present
+        if "id" not in conversation_data:
+            conversation_data["id"] = conversation_data["conversation_id"]
 
         try:
-            self.container.create_item(body=memory_item)
-            print(f"[CosmosDB] Memory saved for {user_id}")
+            self.container.upsert_item(body=conversation_data)
+            print(f"[CosmosDB] Memory saved for {user_id} (ID: {conversation_data['id']})")
         except Exception as e:
             print(f"[CosmosDB] Save Error: {e}")
 
@@ -64,7 +63,7 @@ class CosmosDBService:
         query = (
             f"SELECT * FROM c WHERE c.user_id = '{user_id}' "
             "AND (NOT IS_DEFINED(c.doc_type) OR c.doc_type = 'memory') "
-            "ORDER BY c.date ASC"
+            "ORDER BY c.started_at ASC"
         )
 
         try:
