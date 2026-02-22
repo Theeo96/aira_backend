@@ -323,6 +323,20 @@ async def audio_websocket(ws: WebSocket):
         if rami_items:
             rami_mem_str = "You recall these past events:\n" + "\n".join(rami_items)
 
+    # 2.5 Load Personal Assistant Context (Calendar & Gmail)
+    try:
+        from modules.personal_assistant_service import PersonalAssistantService
+        pa_service = await asyncio.to_thread(PersonalAssistantService, user_id)
+        pa_context = await asyncio.to_thread(pa_service.get_context_summary)
+        
+        if pa_context:
+            print("[Server] Successfully loaded Calendar/Gmail context.")
+            pa_injection = f"\n\n[Live Personal Assistant Data (Current Context)]\n{pa_context}"
+            lumi_mem_str += pa_injection
+            rami_mem_str += pa_injection
+    except Exception as e:
+        print(f"[Server] Failed to load Personal Assistant data: {e}")
+
     user_profile = await asyncio.to_thread(cosmos_service.get_user_profile, user_id)
     saved_home_destination = None
     if isinstance(user_profile, dict):
@@ -450,8 +464,9 @@ async def audio_websocket(ws: WebSocket):
                 dynamic_contexts.append(context_text)
             return
         payload = "[LIVE_CONTEXT_UPDATE]\n" + context_text + "\nUse this for current answer."
+        queue_key = "text" if complete_turn else "context"
         for name, q in lumi_rami_manager.queues.items():
-            await q.put(("text", payload))
+            await q.put((queue_key, payload))
 
     proactive_service = ProactiveService(
         response_guard=response_guard,
@@ -868,8 +883,10 @@ async def audio_websocket(ws: WebSocket):
                     # Persist home destination only when classifier says this is a home update utterance.
                     if routed_home_update or (route_source != "llm" and _is_home_update_utterance(text)):
                         home_candidate = str(dest or "").strip()
-                        if not home_candidate and route_source != "llm":
+                        # Fallback: If LLM missed the destination but flagged home_update=True, try regex extraction
+                        if not home_candidate:
                             home_candidate = str(_extract_destination_from_text(text) or "").strip()
+                            
                         if home_candidate:
                             destination_state["name"] = home_candidate
                             destination_state["asked_once"] = False

@@ -112,6 +112,7 @@ class IntentRouter:
             "intent must be one of "
             "[subway_route,bus_route,weather,air_quality,restaurant,news,commute_overview,general,timer,timer_cancel]. "
             "destination should be a concise place/station name or null. "
+            "For 'weather' intent, it means asking for the current temperature or forecast. If the user asks for 'weather news' (날씨 기사, 뉴스), use 'news' intent instead. "
             "For timer intent, set destination=null and timer_seconds as integer seconds from now. "
             "For timer_cancel intent, set destination=null and timer_seconds=null. "
             "If active_timer=true and user asks to do it now/immediately (e.g., '지금 말해줘', '바로 알려줘'), "
@@ -119,7 +120,10 @@ class IntentRouter:
             "For non-timer intents, timer_seconds must be null. "
             "home_update must be true only when the user explicitly indicates home relocation/change "
             "(e.g., moved house, changed home location, says 'my home is now ...'). "
-            "If user is just asking route to another place (friend's home, visit, outing), home_update must be false."
+            "CRITICAL: If home_update is true, the 'destination' key MUST be the name of the newly relocated place. "
+            "If user is just asking route to another place (friend's home, visit, outing), home_update must be false. "
+            "CRITICAL: If the user simply asks 'where is the nearest station/bus stop from here' (가까운 역이 어디야, 가장 가까운 정류장) "
+            "without intending to go to a specific destination, classify intent as 'general', NOT 'subway_route'."
         )
 
         try:

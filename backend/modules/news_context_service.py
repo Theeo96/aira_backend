@@ -160,11 +160,13 @@ class NewsContextService:
             return "해당 뉴스의 상세 내용을 찾지 못했어요."
         title = str(item.get("title") or "").strip()
         desc = re.sub(r"\s+", " ", str(item.get("description") or "").strip())
+        pub_date = str(item.get("pubDate") or "").strip()
+        date_str = f" (발행일: {pub_date})" if pub_date else ""
         if len(desc) > 220:
             desc = desc[:220].rstrip() + "..."
         if title and desc:
-            return f"기사 제목은 '{title}'이고, 핵심 내용은 다음과 같아요. {desc}"
+            return f"기사 제목은 '{title}'{date_str}이고, 핵심 내용은 다음과 같아요. {desc}"
         if title:
-            return f"기사 제목은 '{title}'입니다. 제목 기준으로 핵심만 간단히 설명드릴게요."
+            return f"기사 제목은 '{title}'{date_str}입니다. 제목 기준으로 핵심만 간단히 설명드릴게요."
         return "기사 상세 요약을 만들 수 없어요."
 

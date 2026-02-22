@@ -9,8 +9,6 @@ from azure.cosmos import CosmosClient
 import datetime
 import uuid
 
-# Load Environment Variables (Azure App Service Configuration)
-# These will be set in Azure Portal -> Configuration
 GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID')
 GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET')
 COSMOS_DB_ENDPOINT = os.environ.get('COSMOS_DB_ENDPOINT')
@@ -38,6 +36,9 @@ def init_db():
         except Exception as e:
             print(f"Cosmos DB Error: {e}")
 
+print("Initializing Database for Auth Service...")
+init_db()
+
 # --- OAuth Setup ---
 oauth = OAuth()
 oauth.register(
@@ -50,10 +51,6 @@ oauth.register(
         'prompt': 'consent' # Force consent screen to get refresh_token
     }
 )
-
-@app.on_event("startup")
-async def startup_event():
-    init_db()
 
 @app.get('/')
 async def homepage(request: Request):
@@ -122,10 +119,9 @@ async def auth(request: Request):
             # Check if user exists to preserve their ID
             try:
                 # Query by email
-                query = "SELECT * FROM c WHERE c.email = @email"
-                params = [{"name": "@email", "value": user_info['email']}]
+                query = f"SELECT * FROM c WHERE c.email = '{user_info['email']}'"
                 items = list(user_container.query_items(
-                    query=query, parameters=params, enable_cross_partition_query=True
+                    query=query, enable_cross_partition_query=True
                 ))
                 
                 if items:

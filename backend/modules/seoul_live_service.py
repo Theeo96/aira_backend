@@ -51,14 +51,14 @@ class SeoulLiveService:
                 news_items = self.get_news_items(topic=topic, limit=3) or []
 
             headlines = []
-            if self.get_news_headlines:
-                headlines = self.get_news_headlines(topic=topic, limit=3) or []
-            if (not headlines) and news_items:
+            if news_items:
                 for item in news_items:
                     if isinstance(item, dict):
                         title = str(item.get("title") or "").strip()
+                        pub_date = str(item.get("pubDate") or "").strip()
+                        date_str = f" (발행일: {pub_date})" if pub_date else ""
                         if title:
-                            headlines.append(title)
+                            headlines.append(f"{title}{date_str}")
 
             if headlines:
                 summary = f"{topic} 기준 최신 뉴스입니다. " + " / ".join([f"{idx+1}. {h}" for idx, h in enumerate(headlines)])

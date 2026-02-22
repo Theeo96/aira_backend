@@ -25,10 +25,16 @@ class CosmosDBService:
                 id=CONTAINER_NAME,
                 partition_key="/user_id"
             )
-            print(f"[CosmosDB] Connected to container '{CONTAINER_NAME}'.")
+            # Add users container for OAuth token retrieval
+            self.users_container = self.database.create_container_if_not_exists(
+                id="users",
+                partition_key="/email"
+            )
+            print(f"[CosmosDB] Connected to container '{CONTAINER_NAME}' and 'users'.")
         except Exception as e:
             print(f"[CosmosDB] Connection Error: {e}")
             self.container = None
+            self.users_container = None
 
     def save_memory(self, user_id, full_transcript, summary_json):
         if not self.container: return
@@ -56,16 +62,14 @@ class CosmosDBService:
         if not self.container: return []
 
         query = (
-            "SELECT * FROM c WHERE c.user_id = @user_id "
+            f"SELECT * FROM c WHERE c.user_id = '{user_id}' "
             "AND (NOT IS_DEFINED(c.doc_type) OR c.doc_type = 'memory') "
             "ORDER BY c.date ASC"
         )
-        params = [{"name": "@user_id", "value": user_id}]
 
         try:
             items = list(self.container.query_items(
                 query=query,
-                parameters=params,
                 enable_cross_partition_query=False
             ))
             return items
@@ -104,6 +108,24 @@ class CosmosDBService:
             return current
         except Exception as e:
             print(f"[CosmosDB] Profile Upsert Error: {e}")
+            return None
+
+    def get_user_by_email(self, email: str):
+        if hasattr(self, 'users_container') and not self.users_container:
+            return None
+        
+        query = f"SELECT * FROM c WHERE c.email = '{email}'"
+
+        try:
+            items = list(self.users_container.query_items(
+                query=query,
+                enable_cross_partition_query=True
+            ))
+            if items:
+                return items[0]
+            return None
+        except Exception as e:
+            print(f"[CosmosDB] Fetch User Error: {e}")
             return None
 
 cosmos_service = CosmosDBService()

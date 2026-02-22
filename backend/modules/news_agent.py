@@ -193,8 +193,13 @@ class NewsAgent(BaseModule):
         if display is None:
             display = self.config.NAVER_DISPLAY_COUNT
 
-        encoded = urllib.parse.quote(keyword)
-        url = f"https://openapi.naver.com/v1/search/news.json?query={encoded}&display={display}&sort={self.config.NAVER_SORT}"
+        safe_keyword = str(keyword).strip()
+        if not safe_keyword:
+            safe_keyword = "최신 뉴스"
+
+        encoded = urllib.parse.quote(safe_keyword)
+        # FORCE sort=date to prevent outdated "sim" (accuracy) 2024 results
+        url = f"https://openapi.naver.com/v1/search/news.json?query={encoded}&display={display}&sort=date"
         
         headers = {
             "X-Naver-Client-Id": self.naver_client_id,
