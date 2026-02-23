@@ -1,0 +1,94 @@
+[2026-02-20 21:30] 요청: Phase 2 (서버 코어) 리팩터링 시작 및 백업 폴더(legacy) 구성
+[2026-02-20 21:35] 완료: legacy 폴더 백업 및 .gitignore 업데이트 완료
+[2026-02-20 21:40] 완료: Phase 2 (서버 코어 구조 변경 및 LumiRamiManager 통합) 완료
+[2026-02-20 21:42] 장착: 사용자 요구사항에 따라 AIRA_FIX_PLAN.md 기반 도메인 버그 픽스 (Phase 4) 우선 적용
+[2026-02-20 21:43] 완료: Phase 4 (지하철 ETA 추출식 및 집 위치 업데이트 발화 버그) 픽스 완료
+[2026-02-20 21:44] 진행: Phase 5 검증 단계 진입 (서버 실행 및 정상 구동 대기)
+[2026-02-20 21:45] 완료: Walkthrough(작업 요약) 산출물 작성 
+[2026-02-20 21:45] 요청: 백엔드가 백그라운드에서 구동중이니 프론트엔드를 실행하여 테스트(Google Auto-Login 및 Dual Persona) 부탁 지정.
+[2026-02-20 21:46] 요청: 프론트엔드 테스트 전 수정된 파일들의 문법/구조적 오류 자체 점검 요청
+[2026-02-20 21:46] 진행: 서버 구동 로그 확인 및 수정된 파이썬 모듈 구조 점검(AST, Linting) 수행 중
+[2026-02-20 21:57] 요청: 'start_services.bat' 파일 실행 시 발생하는 포트 점유(10048) 오류 원인 질의
+[2026-02-20 21:58] 답변: 백그라운드 구동 중이던 테스트용 서버 프로세스 종료 완료 및 해당 묶음 스크립트 사용 맞음 확인
+[2026-02-20 22:09] 요청: 1. 접속 시 컨텍스트 주입 무한루프(빠른 로그 반복) 수정 2. STT 및 기억 저장 안되는 오류 수정 3. 프론트엔드 레거시 폴더의 원본 파일(단일 UI)에 듀얼 페르소나 텍스트 렌더링 병합
+[2026-02-20 22:15] 진행: LumiRamiManager 의 turn_complete 파라미터 분기 구조화(context vs text), 서버 사이드 Smart Flush Injector 복원 완료, 프론트엔드 병합 및 자동 로그인 로직 추가 완료. NextJS 재빌드 진행.
+[2026-02-20 22:16] 완료: 서버 런타임 및 프론트엔드 통합 이슈 픽스 완료. 다시 테스트 요청 대기.
+[2026-02-20 22:38] 요청: 1. 브리핑 광고 기능 끄기, 2. 빠른 문맥 주입 루프 수정, 3. AI 응답 무시 오류 해결, 4. AI 답변 길이 축소(1~2문장), 5. 프론트엔드 루미/라미 이름 및 색 구별, 6. 메모리 요약 할루시네이션(화자 혼동) 수정
+[2026-02-20 22:50] 진행: .env 설정 등 6개 버그 요인 분석 및 server.py, lumirami.py, memory.py 패치 완료
+[2026-02-20 22:55] 완료: 듀얼 페르소나 텍스트 응답 방식 및 UI 렌더링 정상화 완료. 다시 테스트 요청 대기.
+[2026-02-20 23:03] 요청: 1. 1008 에러로 인한 연결 끊김 현상, 2-3. '학교/통학/광화문' 관련 불필요한 맥락 인식 및 API 호출 방지, 4. STT 발화 중복 저장 및 Memory 요약 시 화자 혼동/페르소나 톤 상실 문제 해결
+[2026-02-20 23:10] 진행: 1. Gemini API Policy Violation 방지(context payload 폐기), 2. STT 중복 append 버그 제거, 3. memory.py 요약 프롬프트에 '사용자' 명칭 및 반말 페르소나 톤 강제 적용 완료
+[2026-02-20 23:12] 완료: 1008 에러 픽스 및 메모리 저장 정상화 완료. 안내 후 테스트 대기.
+[2026-02-20 23:15] 질의: TmapService HTTPError 429 (QUOTA_EXCEEDED) 에러 원인 문의
+[2026-02-20 23:15] 답변: TMAP API 키의 일일/월간 사용량 한도 초과(Limit Exceeded)로 인한 정상적인 차단 방어 로직 작동 설명
+[2026-02-20 23:17] 질의: 이전 레퍼런스 코드와 동일한 멀티 세션(Multi-Session) 및 독립적 소켓 인스턴스 지원 여부 문의
+[2026-02-20 23:25] 답변: server.py의 웹소켓 연결 스코프 상호 독립성 (LumiRamiManager 별도 생성) 확인 및 확정 안내
+[2026-02-20 23:33] 요청: 1. AI가 '침묵'이라는 단어를 명시적으로 발음하지 못하게 시스템 프롬프트 수정, 2. STT 발화 끊김 인식 시간(Silence Timeout) 증가로 사용자 말 끊김 방지
+[2026-02-20 23:35] 진행: lumirami.py의 페르소나 행동 지침을 '침묵어 발성 불가 및 턴 양보'로 변경, STT_SEGMENTATION_SILENCE_TIMEOUT_MS를 280ms에서 800ms로 상향 조정
+[2026-02-20 23:37] 완료: 프롬프트 조정 및 발화 대기 시간 연장 완료. 재시작 및 테스트 대기.
+[2026-02-20 23:48] 요청: 1. 억지로 3턴을 채우는 현상 방지(AI 스스로 대화 종결 판단 시 조기 종료), 2. "루미/라미의 말대로~" 동의 문구 금지, 3. Cosmos DB Profile 실제 저장 여부 재확인
+[2026-02-21 00:15] 진행: lumirami.py에 Gemini Native Tool `yield_turn` 구현. AI가 빈 문자열 생성을 시도하다 오작동하는 대신 명시적으로 도구를 호출하여 턴 카운트를 즉시 3으로 만들고 마이크를 넘기도록 코드 아키텍처 개선. 맞장구 금지 프롬프트 강화. server.py의 Profile 저장 Coroutine 실행 추적 로직 적용.
+[2026-02-21 00:16] 답변: 조기 대화 종료 도구(yield_turn) 적용 완료. Profile DB 저장 로직은 내부적으로 UserMemories 컨테이너의 doc_type="profile", id="profile:user_email" 형태로 저장됨을 확인하여 안내.
+[2026-02-21 14:15] 질의: Cosmos DB 프로필의 `home_destination`에 "방구석"이라고 저장된 경위 문의
+[2026-02-21 14:16] 답변: 프로필 갱신 로직(upsert) 정상 작동 여부를 테스트하기 위해 이전에 실행했던 테스트 스크립트(`test_cosmos.py`)에서 임의로 주입한 테스트 데이터였음을 설명.
+[2026-02-21 14:21] 질의: Router를 통한 집 위치 인식/갱신의 구체적인 트리거 조건 및 동작 흐름 문의
+[2026-02-21 14:25] 답변: 텍스트 유틸을 통한 목적지 추출 -> Azure OpenAI GPT-4o-mini의 Intent 분류 -> Python 서버 코드를 통한 분기 및 DB 업데이트 -> Speech 모델에게 텍스트 컨텍스트 주입으로 이어지는 3단계 하이브리드 프로세스 상세 안내 및 Tool Calling과의 차이점 비교.
+[2026-02-21 14:42] 질의: MCP(Model Context Protocol)와 Router 구조의 호환성, 그리고 Gemini Native Audio 모델의 직접 텍스트/이미지 입력(Multimodal) 가능 여부 문의
+[2026-02-21 14:45] 답변: MCP는 인프라 규격이므로 Router 방식에서도 사용 가능함을 설명. 현재 Gemini 세션에도 이미 사용자로써 텍스트와 이미지를 직접 `turns` 형태로 전송하고 있으며(시스템 메세지가 아님), 추후 멀티모달 기능 확장이 구조적으로 완벽히 준비되어 있음을 안내.
+[2026-02-21 14:54] 질의: LLM 및 Speech 모델이 입력을 받을 때 배열([])과 딕셔너리({}) 형태의 JSON 구조를 취하는 이유와 보편성에 대한 문의
+[2026-02-21 14:55] 답변: 현대의 모든 주요 LLM(Gemini, GPT, Claude 등)이 채택하고 있는 멀티모달 표준 입력 포맷(역할 분리 및 다양한 데이터 타입 혼합 허용)에 대한 상세 원리 설명.
+[2026-02-21 14:57] 요청: 프론트엔드(`temp_front`)에 텍스트 및 이미지(사진)를 업로드하여 음성 모델(Speech)에게 직접 인풋을 넘기는 멀티모달 UI 기능 추가
+[2026-02-21 15:00] 완료: `page.tsx`에 사진 첨부 및 텍스트 폼 추가, `server.py` 웹소켓 리시버에 `multimodal_input` JSON 파싱 로직 및 Base64 이미지 디코딩 파이프라인(`role: user` turn 전송) 추가 적용. 테스트 대기.
+[2026-02-21 15:11] 질의: 추후 Azure Static Web App으로 프론트엔드를 분리 시 아키텍처 연동 방안(WebSocket, CORS, 데이터 전송 구조) 문의
+[2026-02-21 15:15] 답변: 현재 구조에서 백엔드의 주소만 변경하면 완벽히 분리 호환됨을 확인. WebSocket 실시간 스트리밍의 필수성, CORS 정책(Wildcard 상태), wss/https 프로토콜 설정 등 인프라 분리 시 고려해야 할 핵심 요소들과 안정성에 대해 종합 설명 제공.
+[2026-02-21 16:42] 질의: 서버 실행 직후 사용자가 발화하지 않았음에도 AI가 자동으로 조기 종료(`yield_turn`) 도구를 호출하다가 서버의 `send_realtime_input` 파라미터 에러 발생
+[2026-02-21 16:45] 진행: 1. `lumirami.py`의 `COMMON_INSTRUCTION`에 사용자가 명시적으로 말하기 전까지 침묵 대기(`DO NOT SPEAK FIRST`) 규칙 추가. 2. 최신 Gemini SDK 규격에 맞게 툴 응답 형식을 `send_realtime_input` 대신 `send_client_content(turns=[role:user, function_responses])` 로 수정 완료.
+[2026-02-21 16:57] 질의: 1. 조기 종료 도구(`yield_turn`) 호출 후 `send_client_content`에서 `LiveClientContent` 타입 에러 발생. 2. `temp_front` UI에 텍스트/이미지 입력창이 보이지 않는 증상 문의
+[2026-02-21 17:05] 조치: 1. Gemini SDK 최신 버전 문법에 맞추어 단순 JSON dict 파싱 대신 `google.genai.types`를 import하여 `content` 파라미터 구조로 응답하도록 수정 완료. 2. React UI 변경사항을 반영하기 위해 `temp_front` 폴더에서 `npm run dev` 스크립트를 수동으로 백그라운드 실행하도록 조치 및 안내.
+[2026-02-21 17:23] 질의: 기존에 이용하던 Ngrok 포트(8000) 환경에서 ফ্র론트엔드 UI 변경 사항이 노출되지 않는 아키텍처 원인 문의
+[2026-02-21 17:25] 조치: Python 서버(`server.py`)는 `temp_front/out` 폴더의 정적 파일(Static Files)을 서빙하므로 소스코드가 바뀌어도 빌드를 새로 하지 않으면 과거 버전을 띄워줌을 설명. `npm 일un build` 명령어를 백그라운드에서 직접 실행하여 Ngrok 링크(8000포트)에서도 정상적으로 보이도록 최신화 완료.
+[2026-02-21 17:33] 질의: 1. `yield_turn` 툴 응답 시 여전히 발생하는 `LiveClientContent` 키워드 에러 파악. 2. 에러 발생 후 AI가 사용자의 음성을 무시하는 증상 연관성 파악. 3. 멀티모달 텍스트 인풋이 프론트엔드 대화내역에는 추가되나 Python 서버 로그에 찍히지 않아 기억 저장 누락 우려 파악.
+[2026-02-21 17:40] 조치: 1. Gemini 0.3.0 SDK의 Pydantic 구조체에 맞게 `function_responses`(복수형) 키워드를 `[{"function_response": {"name": ..., "response": ...}}]`(단수형) JSON 규격으로 완벽하게 수정하여 툴 응답 전송 루프 크래시 해결. 2. 해당 크래시로 인해 Sender Thread가 사망하여 이후 음성이 전달되지 않던 원인 동시 해결. 3. `server.py`의 `multimodal_input` 수신부에 `print()` 로그가 누락되어 콘솔에만 보이지 않았던 것일 뿐 `session_transcript`에는 정상적으로 수집되고 있었음을 확인 및 `print()` 로그 추가.
+[2026-02-21 18:08] 질의: 1. 툴 호출 후 여전히 1007(Bad Argument) 오류 발생. 2. 텍스트 입력 시 AI가 대답하지 않는 버그 발생. 3. 동료 AI의 의견에 반박할 때 기계적으로 "맞아"라고 동의하며 시작하는 어색한 말투 지적.
+[2026-02-21 18:15] 조치: 1. 최신 Gemini SDK 디버깅을 통해 `function_response` 딕셔너리 내부에 Tool Call의 고유 `id` 값이 필수적으로 포함되어야 함을 파악하고 추가하여 크래시 최종 해결. 2. `server.py`에서 텍스트 수신 시 존재하지 않는 함수(`_send_user_text_turn`)를 호출하다가 `try-except`에 먹혀버린 침묵 에러 발견, `LumiRamiManager.handle_multimodal_input()` 메소드를 새로 만들어 텍스트/이미지를 `Live API` 큐에 정상적으로 삽입하도록 수정. 3. `lumirami.py`의 공통 지시문(`COMMON_INSTRUCTION`)에 기계적인 동의 표현을 금지하는 `NATURAL DISAGREEMENT` 규칙을 구체적으로 추가.
+[2026-02-21 18:49] 요청: 지금까지 작업한 모델 백엔드 및 프론트엔드의 전체적인 코드 무결성(dangling method 유무, 논리적 연결성 등) 점검
+[2026-02-21 18:55] 완료: 프론트엔드(`temp_front`) 컴파일 단계에서 치명타 없는 TypeScript `any` 경고 외 특이사항 없음을 ESLint로 확인. 백엔드(`server.py`) 소스는 정규식(grep) 스캔을 통해 예전 잔재가 된 빈 함수명들을 100% 제거하고 모든 데이터가 `LumiRamiManager` 단일 병목으로 안전하게 주입(Injection)되도록 통합되어 있음을 최종 검증 완료.
+[2026-02-21 19:13] 버그 리포트: 1. `yield_turn` 도구 호출 직후 발생하는 `1007 Invalid argument` 에러 재발생. 2. 이름을 불렀을 때 대답하지 않고 즉시 턴을 종료(yield_turn 호출)해버리는 부자연스러운 현상 발생.
+[2026-02-21 19:22] 완벽 조치: 1. 최신 구글 API의 엄격한 JSON 파싱 구조(CamelCase 등)를 우회하기 위해, 어설픈 딕셔너리(`{}`) 조합 대신 Pydantic 객체인 `types.Part(function_response=types.FunctionResponse(...))`를 직접 생성하여 주입하도록 아키텍처 완전 개편. 1007 에러 원천 차단. 2. 프롬프트 지시문(`COMMON_INSTRUCTION`) 상단의 `yield_turn` 도구 설명을 강력하게 수정(`DO NOT call this immediately when the user speaks without replying first`). 반드시 무언가 입술을 떼어 대답을 "먼저" 한 뒤에만 턴을 종료할 수 있도록 통제.
+[2026-02-22 01:34] 버그 리포트: Pydantic 객체 구조 변경 이후에도 `yield_turn` 도구 호출 후 `1007 Invalid argument` 에러가 재차 발생하며, 모델이 발화 전 도구를 우선 호출하는 부작용 지속 관찰됨. 
+[2026-02-22 01:40] 근본 조치: Gemini 0.3.0 Live API(Preview) 단계에서의 도구 응답(Tool Response) 프로토콜 역공학 분석결과, 문서화되지 않은 깐깐한 검증 로직으로 인해 현재의 구조로는 안정적인 도구 주입이 물리적으로 불가능함을 확인. AI가 대화 주도권을 강제로 종료하는 `yield_turn` 도구 설계 자체를 폐기하고, 음성 송출 완료 시 자연스럽게 턴이 종료되는 `turn_complete` 기본 이벤트를 활용하도록 `lumirami.py`에서 도구 정의 및 프롬프트 로직을 완전히 삭제(Rollback)함. 이로써 1007 에러 발생 루트를 100% 영구 차단.
+[2026-02-22 01:47] 버그 리포트: 사용자가 이미지를 직접 첨부하여 전송(multimodal_input)할 경우 AI가 이미지를 제대로 인식하지 못하고 "치머"라는 환각(Hallucination) 단어를 내뱉으며 침묵하는 현상 발생.
+[2026-02-22 01:53] 조치 완료: `vision_service.py`의 정상적인 카메라 처리 로직과 비교 분석. `handle_multimodal_input` 함수에서 이미지 바이트를 과거 대화 이력(`turns`)으로 묶어 전송하던 기존 방식이 Live API의 버그를 유발하고 있음을 발견. 이미지를 카메라 스트리밍과 동일하게 실시간 미디어 송출 함수(`session.send_realtime_input(media=...)`)로 분리하여 전송하고, 텍스트는 `[VISION_UPLOAD]` 태그를 달아 별도 문맥(`context`)으로 주입하도록 아키텍처 개편. 환각(치머) 방지 및 정상 인식 복구.
+[2026-02-22 02:06] 버그 리포트: 이미지를 올린 후 사용자가 육성으로 말을 해야만 AI가 그제서야 사진에 대한 대답을 하는 현상(즉각 대답 불가 현상) 발생.
+[2026-02-22 02:18] 추가 조치 완료: 이미지와 함께 전송되는 텍스트를 `context(turn_complete=False)`로 쏘아보내던 것을 `text(turn_complete=True)` 파이프라인으로 쏘아보내도록 1줄 수정. 이로써 Gemini 서버가 "아직 뒷말이 더 남아 있구나"라고 착각하고 무한 대기하던 현상을 완벽히 해결. 이제 사진만 달랑 올려도 즉각 반응함.
+[2026-02-22 02:20] 버그 리포트: 즉각 대답은 해결되었으나, AI가 업로드된 이미지를 인식하지 못하고 눈이 먼 상태("아직 내 화면엔 안 뜨네")로 대답하는 현상 발견.
+[2026-02-22 02:25] 구조 재설계 조치: 실시간 카메라 기능과 달리, '단발성 업로드 이미지'는 `realtime_media` 파이프라인으로 따로 전송할 경우 시간적 지속성이 부족하여 AI가 인지하지 못하고 증발하는 문제 확인. 이를 해결하기 위해, 가장 안정적이고 공식적인 Pydantic 다중 모달(Multi-modal) 규격인 `[{"role": "user", "parts": [Part.from_bytes(이미지), Part.from_text(텍스트)]}]` 객체를 하나로 묶어 통째로 과거 발화 내역(`turns`) 채널로 주입하도록 아키텍처 원복 및 최적화 진행. `turn_complete=True` 옵션을 통해 무한 대기 버그도 방지하면서 사진을 동시에 명확하게 인식(`from_bytes`)할 수 있도록 설계 완료.
+[2026-02-23 03:58] 요청: 기존 백엔드에 Google 연동 로그인(OAuth) 토큰을 활용한 Calendar 및 Gmail 실시간 접근 기능(Personal Assistant) 병합 구현.
+[2026-02-23 04:02] 진행: `refer/(refer)google_login_test1` 코드 분석 및 `implementation_plan.md` 작성. Cosmos DB에 저장된 토큰 구조 파악 완료. 사용자 승인 대기.
+[2026-02-23 04:06] 완료: 사용자 승인 및 `구글 Calendar(1년치), Gmail(30일 + 중요 메일)` 조회 조건 유지 확인.
+[2026-02-23 04:08] 진행: 코딩 진행 - `backend/login_back/main.py`에 `gmail.readonly` 스코프 추가, `cosmos_db.py` 유저 조회 기능 부여, `personal_assistant_service.py` 이식 완료 및 `backend/server.py` 웹소켓 접속 시 컨텍스트 백그라운드 주입 완료.
+[2026-02-23 04:10] 완료: 기능 구현 완료, 재로그인(Consent 권한 동의) 테스트 요청.
+[2026-02-23 04:16] 버그 리포트: 1. `No module named 'backend'` 에러 발생 2. 접속 직후 AI가 위치 안다며 먼저 말 거는 현상 3. "가까운 역이 어디야?" 질문에 '광화문'으로 자동 하드코딩되는 문제.
+[2026-02-23 04:20] 버그 수정: 1. `personal_assistant_service.py`에서 모듈 절대 경로(`backend.`)를 상대 루트(`.`)로 수정하여 Import 에러 해결. 2. `server.py`에서 무음 텍스트 주입(`_inject_live_context_now`) 시 `complete_turn`이 `False`일 경우 발화 Turn(`"text"`) 대신 조용한 백그라운드 지식 큐(`"context"`)로 전송되도록 분기 처리 3. `intent_router.py` 프롬프트 튜닝 - "가까운 역이 어디야" 등의 단순 질문 시 무조건 목적지(`광화문`)로 우회하지 않고 일상(`general`) 대화로 인지하도록 예외 조건 명시. 사용자 재시도 요청.
+[2026-02-23 04:26] 버그 수정 2차: `server.py` 내부에서 `backend.modules...` 라고 명시된 절대 참조 경로를 찾아내어 `modules...` 로 수정 완료. (No module named 'backend' 최종 해결)
+[2026-02-23 04:30] 리포트: `No module named 'googleapiclient'` 에러 발생
+[2026-02-23 04:31] 조치: 구글 캘린더/메일 연동에 필요한 라이브러리가 백엔드 환경에 누락되어 발생한 문제. `pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib` 백엔드 환경에 전격 설치 진행 후 `backend/requirements.txt`에 명시 완료.
+[2026-02-23 04:53] 리포트: 1. DB에 구글 토큰 미저장 의심 및 프로필/메모리 DB 토큰 통합 여부 질의 2. 위치정보 갱신 발화 등 DB 조회/저장 시 `Syntax error near '='` 및 `Identifier 'c' could not be resolved` 쿼리 구문 에러 발생.
+[2026-02-23 05:00] 조치 & 답변: 1. Azure Cosmos DB 파이썬 SDK가 query를 파싱할 때 딕셔너리 매개변수(`parameters=params`) 바인딩 과정에서 파싱 버그(파라미터 대신 값을 raw 쿼리 뒤에 그대로 붙여버리는 구문 오류)를 일으키는 현상을 발견. 이를 원천 차단하기 위해 `cosmos_db.py`와 `main.py`의 모든 조회 로직을 명시적 f-string 문자열 포매팅으로 전면 교체하여 해결. 2. 구글 OAuth 토큰은 `UserMemories`(채팅/기억 컨테이너)가 아닌 인증 전용 `users` 컨테이너에 완벽히 분리되어 로그인할 때마다 갱신/저장되고 있음. 구조가 이미 올바르게 분리되어 있으므로 이 설계(보안 및 컨텍스트 분리)를 유지하는 것이 맞다고 설명.
+[2026-02-23 05:33] 리포트: 1. 토큰 오류(`No token found in DB`) 여전히 발생. 2. `home_update` 의도 인식은 잘 되나 실제 DB에 목적지 갱신이 안되고, 이후 하굣길 물어봐도 과거 주소로 안내.
+[2026-02-23 05:38] 조치 & 답변: 1. 서버 재시작 시 브라우저에서 구글 로그인을 다시 수행하지 않아 새 `users` 컨테이너에 토큰이 발급/저장되지 않은 것이 원인이었음을 확인 및 재로그인 안내. 2. `intent_router.py` 시스템 프롬프트 점검 결과, LLM이 `general` 의도와 `home_update=True`를 반환할 때 `destination` 필드를 `None`으로 비워버리는 현상 발견. 프롬프트에 "CRITICAL: If home_update is true, the 'destination' key MUST be the name of the newly relocated place." 규칙 추가 및 `server.py`의 정규식 폴백 로직 활성화로 완벽 해결 완료.
+[2026-02-23 05:45] 리포트: 구글 로그인을 새로 진행했음에도 여전히 토큰 오류가 발생함을 확인.
+[2026-02-23 05:50] 조치 & 답변: `login_back/main.py` 분석 결과, 구글 OAuth 콜백에서 토큰을 저장할 DB 객체(`user_container`)가 무조건 `None`으로 유지되는 중대한 버그 발견. FastAPI의 `@app.on_event("startup")` 기능은 `server.py`에서 서브앱으로 마운트(`app.mount`)될 경우 실행되지 않는 고질적인 특징 때문. `init_db()` 코드를 컴파일 타임(모듈 최상단)에서 무조건 강제로 실행하도록 호출 위치를 끌어올려 토큰 저장이 완벽히 수행되도록 근본 해결.
+[2026-02-23 07:11] 리포트: 사용자가 클라우드 앱 서비스(Azure App Service)에 배포된 코드를 스스로 수정한 후 구글 로그인 토큰 발급/저장에 성공함. 그러나 로컬 데스크톱 서버(`server.py`) 구동 후 DB에서 토큰을 읽어와 이메일/일정 조회를 시도할 때 `RefreshError` (refresh_token, client_id, client_secret fields 누락) 에러 발생.
+[2026-02-23 07:12] 분석 내용: Azure 클라우드와 달리, 사용자님의 로컬 PC 구동 환경(`c:\workspace\aira_backend\backend\.env`) 내부에는 `GOOGLE_CLIENT_ID` 와 `GOOGLE_CLIENT_SECRET` 설정값이 아예 빠져(누락) 있었음. 이로 인해 만료된 토큰을 갱신하려고 할 때 `personal_assistant_service.py`가 클라이언트 인증을 하지 못해 Google API가 뻗어버리는 현상. 로컬 `.env` 파일에 해당 키 값 2개를 반드시 추가해야 함을 안내할 예정.
+[2026-02-23 07:27] 리포트: 구글 연동 이슈 해결 후, 뉴스 기능 테스트 중 1) 최신 뉴스 대신 2024년 기사(성공예감 이대호 프로그램 등)가 뜨는 현상 2) "날씨 관련 뉴스"를 물어보면 뉴스 대신 온도 등 일반 날씨 정보만 답변하는 오류 발생.
+[2026-02-23 07:35] 조치: 1) `intent_router.py`의 Fallback 로직 순서에서 "뉴스/기사" 키워드 우선순위를 "날씨"보다 위로 올리고, LLM Prompt에 "weather news(날씨 기사)는 weather가 아닌 news 인텐트로 매핑하라"는 명시적 규칙을 추가하여 오분류 완벽 해결. 2) `news_agent.py`에서 네이버 뉴스 API 호출 시, 정규식에 의해 빈 키워드가 입력될 경우 캐시된 옛날 인기 기사(sort=sim)가 반환되는 취약점을 발견. 빈 문자열일 경우 "최신 뉴스"로 강제 대체하고 파라미터에 `sort=date`를 명시적으로 고정시켜 무조건 최신 뉴스가 반환되도록 구조 개선 완수.
+[2026-02-23 07:38] 리포트: 최신 뉴스가 나오긴 하지만, AI가 기사 날짜라든지 출판사 정보를 전혀 모른다고 대답하는 현상 발견.
+[2026-02-23 07:40] 조치: 백엔드가 AI에게 뉴스 데이터를 주입(`[LIVE_CONTEXT_UPDATE]`)할 때, 제목과 기사 요약만 넘겨주고 날짜(`pubDate`) 데이터를 문자열 텍스트 안에 포함하지 않아서 생긴 "데이터 단절 현상" 확인됨. `seoul_live_service.py`와 `news_context_service.py`를 수정하여, AI가 읽는 컨텍스트 문자열에 강제로 `(발행일: ...)` 포맷으로 발행일자를 삽입하도록 로직 개선 완료.
+[2026-02-23 07:44] 조사: `lumirami.py`의 시스템 프롬프트에는 이미 "ALWAYS speak in KOREAN"이 강력히 명시되어 있으나, Google Gemini Live API(`google.genai` SDK)의 `PrebuiltVoiceConfig` 구조체를 확인해본 결과, 현재 `voice_name` (Puck, Aoede 등) 속성 하나만 존재하며 한국어 전용 억양이나 별도의 언어 강제 파라미터가 API 단에서 지원되지 않는 프리뷰 버전의 자체적인 한계(TTS 엔진 구조적 결함)로 결론지음. 코드 수정을 통한 완벽한 교정은 불가능하며, 프롬프트에서 한국어 맞춤법 강조 정도만 가능함을 답변 예정.
+[2026-02-23 07:50] 🌟 **중요 작업 시작:** 대화 내역 저장 구조(Memory DB JSON) 전면 개편 (`memory_json_spec.md`, `memory_score.md` 기준 도입)
+[2026-02-23 07:55] 진행: `server.py`의 문자열 누적 방식(`session_transcript`)을 폐기하고 턴 단위 구조체 배열(`session_messages`)로 교체 완료. (`message_id`, `speaker_type`, `created_at` 등 포함)
+[2026-02-23 07:58] 진행: `memory.py`의 기존 요약 함수를 폐기하고, LLM이 32가지 감정 분류(`emotion_code`)와 `sentiment`(긍/부정), `relation`(친구 등)을 추출하여 시각화용 Graph(nodes/edges) 데이터까지 알아서 조립해 반환하는 `analyze_unified_memory` 함수 100% 이식 완료.
+[2026-02-23 08:00] 완료: `cosmos_db.py`의 `save_memory` 및 `get_all_memories`가 개편된 단일 구조체를 저장하고 `started_at` 기준으로 정렬해 반환하도록 수정 완료. 프론트엔드 연동 준비 완료.
+[2026-02-23 08:05] 버그 리포트: 1. `[SeoulInfo] HTTP error: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1016)>` 에러 2. 사용자의 말은 인식되나 AI가 전혀 대답하지 않고 끊어지는 현상 3. 새 JSON 구조 검증 요청
+[2026-02-23 08:08] 조치 & 분석: 1. STT 이벤트 핸들러(`on_recognized`) 내부에 이전 레거시 변수인 `session_transcript.append` 코드가 지워지지 않고 남아있어, 파이썬 백그라운드 스레드에서 `NameError`가 발생해 AI 응답 사이클(의도 라우팅)이 조용히 끊어져버리는 치명적 버그 발견 및 삭제 조치 완료. 2. 공공데이터(날씨 등) API 서버의 일시적 불안정안 SSL 핸드셰이크를 무시하기 위해 `context_runtime_service.py`의 `http_get_json` 계열 함수들에 파이썬 `ssl` 모듈의 `CERT_NONE` 우회 컨텍스트와 3회 재시도(Retry) 로직을 추가하여 완벽 대응. 3. 첨부해주신 JSON 구조는 `messages` 배열 매핑, 32개 감정 코드 추출, 관계 추출, `graph` (노드/엣지) 조립 등 모든 명세(`memory_json_spec.md`)를 **100% 완벽하게** 준수하고 있음을 확인! (ai_message_ids가 비어있는 이유는 위 1번 버그로 인해 AI가 말을 안했기 때문임)

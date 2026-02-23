@@ -4,7 +4,7 @@ echo [Aira] Starting Aira (Single Port)...
 :: Start Backend (Multi-Worker)
 echo Starting Backend (FastAPI with Uvicorn Multi-Worker)...
 echo You only need to tunnel Port 8000.
-start "Aira Backend" cmd /k "call conda activate aira_back && cd backend && python run_server.py"
+start "Aira Backend" cmd /k "cd /d "%~dp0" && call conda activate aira_back && cd backend && python run_server.py"
 
 
 echo ---------------------------------------------------

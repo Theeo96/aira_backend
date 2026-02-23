@@ -1,0 +1,23 @@
+{
+  "wake_up_time": "07:00",
+  "home": {
+    "name": "서울 마포구 공덕동",
+    "lat": 37.548313,
+    "lng": 126.956157
+  },
+  "office": {
+    "name": "서울 종로구 광화문",
+    "lat": 37.572500,
+    "lng": 126.976880
+  },
+  "usual_commute_minutes": 42,
+  "default_transport_mode": "public",
+  "leave_office_window_start_hour": 18,
+  "leave_office_window_end_hour": 19,
+  "interest_keywords": [
+    "AI",
+    "반도체",
+    "금리",
+    "서울 교통"
+  ]
+}
