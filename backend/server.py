@@ -10,10 +10,14 @@ import re
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from starlette.middleware.sessions import SessionMiddleware
+from authlib.integrations.starlette_client import OAuth
+import uuid
+import datetime
 from google import genai
 import sys
 from modules.cosmos_db import cosmos_service
@@ -44,6 +48,24 @@ from modules.lumirami import LumiRamiManager
 
 from contextlib import asynccontextmanager
 
+# --- OAuth Setup ---
+GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID')
+GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET')
+SECRET_KEY = os.environ.get('SECRET_KEY', 'default_secret_key')
+
+oauth = OAuth()
+if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
+    oauth.register(
+        name='google',
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+        client_kwargs={
+            'scope': 'openid email profile https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/gmail.readonly',
+            'prompt': 'consent'
+        }
+    )
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup logic
@@ -54,11 +76,30 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# Custom Session Middleware to bypass WebSockets
+class WebSocketFriendlySessionMiddleware:
+    def __init__(self, app, secret_key: str):
+        self.app = app
+        self.session_middleware = SessionMiddleware(app, secret_key=secret_key)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "websocket":
+            # Bypass SessionMiddleware for websockets completely
+            await self.app(scope, receive, send)
+            return
+        await self.session_middleware(scope, receive, send)
+
+app.add_middleware(WebSocketFriendlySessionMiddleware, secret_key=SECRET_KEY)
+
 
 # Enable CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "*", 
+        "http://localhost:5173", 
+        "https://icy-ground-0066bb800.6.azurestaticapps.net"
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -261,17 +302,18 @@ def create_recognizer(audio_config, language="en-US", silence_timeout_ms: str | 
     )
 
 # --- WebSocket Endpoint ---
-@app.websocket("/ws/audio")
+@app.websocket("/ws")
 async def audio_websocket(ws: WebSocket):
     await ws.accept()
     
     # 1. Auth & Identification
-    user_id = ws.query_params.get("user_id")
+    # Note: Frontend uses '?token=email@gmail.com'
+    user_id = ws.query_params.get("token")
     current_lat = _to_float(ws.query_params.get("lat"))
     current_lng = _to_float(ws.query_params.get("lng"))
     client_state = {"lat": current_lat, "lng": current_lng, "last_log_lat": current_lat, "last_log_lng": current_lng}
     if not user_id or "@" not in user_id:
-        print("[Server] Missing or invalid user_id.")
+        print("[Server] Missing or invalid token.")
         await ws.close(code=1008, reason="Invalid Login Token")
         return
         
@@ -569,25 +611,27 @@ async def audio_websocket(ws: WebSocket):
     async def _send_user_text_with_snapshot_turn(user_text: str, snapshot_bytes: bytes):
         if not getattr(lumi_rami_manager, "running", False):
             return
+            
         import base64 as _b64
         frame_tag = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%H:%M:%S")
+        
+        # 1. Send the image bytes first
+        if hasattr(lumi_rami_manager, "push_image"):
+            await lumi_rami_manager.push_image(snapshot_bytes)
+            
+        # 2. Add text prompt describing the image
         parts = [
             {
                 "text": (
                     "[VISION TURN]\n"
                     f"Frame time: {frame_tag} KST.\n"
-                    "Prioritize this attached current frame first.\n"
+                    "Prioritize the camera frame that was just uploaded.\n"
                     "Only use memory if it does not conflict with the frame."
                 )
             },
-            {"text": f"사용자 질문: {str(user_text or '')}"},
-            {
-                "inline_data": {
-                    "mime_type": "image/jpeg",
-                    "data": _b64.b64encode(snapshot_bytes).decode("utf-8"),
-                }
-            },
+            {"text": f"사용자 질문: {str(user_text or '')}"}
         ]
+        
         payload = [{"role": "user", "parts": parts}]
         for name, q in lumi_rami_manager.queues.items():
             await q.put(("turns", payload))
@@ -1180,13 +1224,13 @@ async def audio_websocket(ws: WebSocket):
                             elif isinstance(payload, dict) and payload.get("type") == "camera_frame_base64":
                                 await vision_service.handle_camera_frame_payload(
                                     payload=payload,
-                                    session_ref=session_ref,
+                                    push_image_now=lumi_rami_manager.push_image if hasattr(lumi_rami_manager, "push_image") else None,
                                     inject_live_context_now=_inject_live_context_now,
                                 )
                             elif isinstance(payload, dict) and payload.get("type") == "camera_snapshot_base64":
                                 await vision_service.handle_camera_snapshot_payload(
                                     payload=payload,
-                                    session_ref=session_ref,
+                                    push_image_now=lumi_rami_manager.push_image if hasattr(lumi_rami_manager, "push_image") else None,
                                     inject_live_context_now=_inject_live_context_now,
                                 )
                             elif isinstance(payload, dict) and payload.get("type") == "multimodal_input":
@@ -1339,6 +1383,91 @@ app.include_router(
         build_speech_summary=build_speech_summary,
     )
 )
+
+@app.get("/api/memory")
+async def get_memory_history(token: str):
+    """
+    Fetch all conversation memories from Cosmos DB for a specific user.
+    'token' acts as the user_id (e.g. user's email address).
+    Returns a unified array of conversation graph and message objects.
+    """
+    if not token:
+        return {"ok": False, "error": "Missing token"}
+    items = await asyncio.to_thread(cosmos_service.get_all_memories, token)
+    return {"ok": True, "data": items}
+
+# --- OAuth Routes for Frontend ---
+
+@app.get('/login')
+async def login(request: Request, redirect_target: str = "http://localhost:5173"):
+    # Save target URL to session
+    request.session['redirect_target'] = redirect_target
+    # Reconstruct the redirect URI based on actual incoming headers (ngrok/azure support)
+    forwarded_proto = request.headers.get("x-forwarded-proto", "http")
+    host = request.headers.get("host", request.url.hostname)
+    if request.url.port and request.url.port not in (80, 443) and ":" not in host:
+         host = f"{host}:{request.url.port}"
+         
+    redirect_uri = f"{forwarded_proto}://{host}/auth"
+        
+    return await oauth.google.authorize_redirect(request, redirect_uri, access_type='offline')
+
+@app.get('/auth')
+async def auth(request: Request):
+    try:
+        token = await oauth.google.authorize_access_token(request)
+        user_info = token.get('userinfo')
+        if not user_info:
+             user_info = await oauth.google.userinfo(token=token)
+
+        # Save/Update User in Cosmos DB (Users Container)
+        if cosmos_service.users_container:
+            user_data = {
+                "id": str(uuid.uuid4()),
+                "email": user_info['email'],
+                "name": user_info.get('name'),
+                "picture": user_info.get('picture'),
+                "last_login": datetime.datetime.utcnow().isoformat(),
+                "google_token": token
+            }
+            
+            try:
+                # Query by email to preserve ID
+                query = "SELECT * FROM c WHERE c.email = @email"
+                params = [{"name": "@email", "value": user_info['email']}]
+                items = list(cosmos_service.users_container.query_items(
+                    query=query, parameters=params, enable_cross_partition_query=True
+                ))
+                if items:
+                    user_data['id'] = items[0]['id']
+                cosmos_service.users_container.upsert_item(user_data)
+                print(f"[Auth] User {user_info['email']} saved/updated.")
+            except Exception as e:
+                print(f"[Auth] DB Save Error: {e}")
+        else:
+            print("[Auth] Missing users_container in Cosmos DB.")
+        
+        # Session Setting
+        request.session['user'] = user_info
+        token_str = user_info['email']
+        request.session['token'] = token_str
+        
+        # [Auto-Login Logic]
+        target_url = request.session.pop('redirect_target', 'http://localhost:5173')
+        # If the target URL already has a query string, append with &, otherwise ?
+        sep = "&" if "?" in target_url else "?"
+        final_redirect = f"{target_url}{sep}token={token_str}"
+        
+        return RedirectResponse(url=final_redirect)
+
+    except Exception as e:
+        return HTMLResponse(f"<h1>Auth Error</h1><p>{e}</p>")
+
+@app.get('/logout')
+async def logout(request: Request, redirect_target: str = "http://localhost:5173"):
+    request.session.pop('user', None)
+    request.session.pop('token', None)
+    return RedirectResponse(url=redirect_target)
 
 # --- Static Files (Frontend) ---
 FRONTEND_BUILD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "temp_front", "out")
