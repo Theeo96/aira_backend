@@ -31,7 +31,7 @@ class VisionService:
 
     async def send_frame_to_gemini(
         self,
-        session_ref: dict,
+        push_image_now: Callable[[bytes], Callable],
         inject_live_context_now,
         image_bytes: bytes,
         mime_type: str = "image/jpeg",
@@ -43,11 +43,10 @@ class VisionService:
         self._record_snapshot(image_bytes=image_bytes, ts=now_ts)
         if now_ts - float(self.camera_state.get("last_frame_ts") or 0.0) < self.min_interval_sec:
             return
-        session_obj = session_ref.get("obj")
-        if not session_obj:
+        if not push_image_now:
             return
         try:
-            await session_obj.send_realtime_input(media={"data": image_bytes, "mime_type": mime_type})
+            await push_image_now(image_bytes)
             self.camera_state["last_frame_ts"] = now_ts
             self.camera_state["frames_sent"] = int(self.camera_state.get("frames_sent") or 0) + 1
             frames = int(self.camera_state["frames_sent"])
@@ -81,7 +80,7 @@ class VisionService:
                 complete_turn=False,
             )
 
-    async def handle_camera_frame_payload(self, payload: dict, session_ref: dict, inject_live_context_now):
+    async def handle_camera_frame_payload(self, payload: dict, push_image_now: Callable, inject_live_context_now):
         if not self.camera_state.get("enabled"):
             return
         b64 = payload.get("data")
@@ -90,7 +89,7 @@ class VisionService:
             try:
                 image_bytes = base64.b64decode(b64)
                 await self.send_frame_to_gemini(
-                    session_ref=session_ref,
+                    push_image_now=push_image_now,
                     inject_live_context_now=inject_live_context_now,
                     image_bytes=image_bytes,
                     mime_type=mime_type,
@@ -98,7 +97,7 @@ class VisionService:
             except Exception as e:
                 self.log(f"[Vision] camera frame decode failed: {e}")
 
-    async def handle_camera_snapshot_payload(self, payload: dict, session_ref: dict, inject_live_context_now):
+    async def handle_camera_snapshot_payload(self, payload: dict, push_image_now: Callable, inject_live_context_now):
         if not self.camera_state.get("enabled"):
             return
         b64 = payload.get("data")
@@ -111,7 +110,7 @@ class VisionService:
                 if updates == 1 or updates % 20 == 0:
                     self.log(f"[Vision] snapshot updated x{updates}")
                 await self.send_frame_to_gemini(
-                    session_ref=session_ref,
+                    push_image_now=push_image_now,
                     inject_live_context_now=inject_live_context_now,
                     image_bytes=image_bytes,
                     mime_type="image/jpeg",

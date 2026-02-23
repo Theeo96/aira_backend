@@ -213,6 +213,10 @@ class LumiRamiManager:
         for name, q in self.queues.items():
             await q.put(("audio", audio_data))
 
+    async def push_image(self, image_bytes: bytes):
+        for name, q in self.queues.items():
+            await q.put(("image", image_bytes))
+
     async def handle_stt_result(self, text: str, role: str):
         if not text: return
         
@@ -263,22 +267,17 @@ class LumiRamiManager:
         self.ai_turn_count = 0
         await self.turn_manager.set_user_turn()
         
-        from google.genai import types
-        
-        # 2. Build the turn natively for google-genai 0.3.0
-        parts = []
+        # 2. Push image via realtimeInput first if attached (Live API Requirement)
         if image_bytes:
-            parts.append(types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"))
-        if text:
-            # Add contextual text tag indicating it was sent as an image prompt
-            prefix = "[VISION_UPLOAD] " if image_bytes else "[USER_TEXT_INPUT] "
-            parts.append(types.Part.from_text(text=f"{prefix}{text}"))
-            
-        turn = [{"role": "user", "parts": parts}]
+            await self.push_image(image_bytes)
         
-        # 3. Queue into all running AI personas
-        for name, q in self.queues.items():
-            await q.put(("turns", turn))
+        # 3. Queue the text as a turn
+        if text:
+            prefix = "[VISION_UPLOAD]\n" if image_bytes else "[USER_TEXT_INPUT]\n"
+            turn = [{"role": "user", "parts": [{"text": f"{prefix}{text}"}]}]
+            
+            for name, q in self.queues.items():
+                await q.put(("turns", turn))
 
     async def _run_persona(self, name: str):
         config_data = self.configs[name]
@@ -318,6 +317,9 @@ class LumiRamiManager:
                                     # [Legacy Type Handling]
                                     if source == "audio":
                                         await session.send_realtime_input(audio={"data": content, "mime_type": "audio/pcm;rate=16000"})
+                                    elif source == "image":
+                                        print(f"[{name}] Sending IMAGE via realtime_input...")
+                                        await session.send_realtime_input(media={"data": content, "mime_type": "image/jpeg"})
                                     elif source == "context":
                                         print(f"[{name}] Sending SILENT CTX: {content[:30]}...")
                                         await session.send_client_content(
