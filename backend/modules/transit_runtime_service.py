@@ -338,6 +338,8 @@ class TransitRuntimeService:
             "busNumbers": [],
             "subwayLine": None,
             "subwayLegs": [],
+            "firstEtaMinutes": None,
+            "nextEtaMinutes": None,
         }
 
         if isinstance(first_ride, dict):
@@ -579,6 +581,8 @@ class TransitRuntimeService:
             "firstStartLat",
             "firstStartLng",
             "subwayLine",
+            "firstEtaMinutes",
+            "nextEtaMinutes",
         ]
         for k in keys:
             v = merged.get(k)

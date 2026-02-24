@@ -102,3 +102,30 @@
 [2026-02-23 17:25] 진행: `.env` 및 `requirements.txt` 분석하여 아키텍처 문서화 진행 및 답변 제공
 [2026-02-23 20:19] 에러 보고: 프론트엔드 카메라 권한 우회 및 base64 헤더 패치 반영 직후 AI(Gemini) 1008 연결 종료 에러 발생
 [2026-02-23 20:30] 버그 해결 (Gemini 1008 Error): 프론트엔드에서 정상적인 base64 문자열을 보내기 시작하자 백엔드(`vision_service.py`)가 비로소 이미지를 성공적으로 디코딩하게 됨. 그러나 이 이미지를 Gemini로 전송할 때, Live API 정책 상 금지된 `clientContent` 내 `inline_data` 파라미터로 삽입하여 전송하는 바람에 1008 WebSocket Policy Violation 모델 에러가 터짐을 확인. `server.py`와 `lumi_rami_manager.py`의 Payload 전송 규격을 `inline_data` 방식에서, 올바른 비디오/오디오 스트리밍 채널인 `realtimeInput(media=...)` 방식으로 코드 리팩토링하여 완벽 해결.
+[2026-02-24 00:22] 이슈 분석 (GPS/Video 미인식): 1008 에러 픽스 이후에도 카메라/위치 인식이 안되는 현상 분석. 구버전 `temp_front` 코드 분석 결과, 백엔드의 상태 스위치(`vision_service.enabled`)를 켜주는 `camera_state` JSON 페이로드 및 실시간 위치 `location_update` 페이로드가 현재 프론트엔드에서 프레임과 함께 전송되지 누락되어 백엔드가 프레임을 고의로 드롭하고 있었음을 확인. 프론트엔드 연동 규격 스펙 정리 및 답변 제공 완료.
+[2026-02-24 00:30] 개선: 루미/라미 말하기 속도 상향 프롬프트 개선을 시도했으나 사용자 요청으로 철회 (Reject) 및 기존 `약간 빠름` 유지.
+[2026-02-24 00:43] 검증 완료: 프론트엔드 담당자의 3가지 JSON Payload (`camera_state`, `location_update`, `multimodal_input`) 구현 스펙을 리뷰하고 백엔드 처리 로직과 100% 동일하게 일치함을 검증 및 승인.
+[2026-02-24 01:05] 진행: Gemini 1008 Inner Receive 오류 원인 분석 및 `LiveClientRealtimeInput` 구조체 분석 완료
+[2026-02-24 01:06] 버그 1차 조치: `lumirami.py`의 실시간 영상 프레임 전송 인자를 `media` 딕셔너리에서 `video` 딕셔너리로 수정하여 1008 크래시 방어 처리 완료
+[2026-02-24 01:06] 진행: ODSay 대중교통 경로 안내 시 문자열 누락 및 파싱 실패 원인 조사 (진행 중)
+[2026-02-24 01:30] 에러 보고: 백엔드의 1008 에러 해결 이후에도 프론트엔드(`aira_frontend`) 연동 시 여전히 AI가 카메라/화면공유를 제대로 인지하지 못하는 증상 보고됨. 원본 코드(`temp_front`)와의 작동 구조 비교 요구.
+[2026-02-24 01:35] 분석 완료: 1. `aira_frontend/src/services/airaSocketService.ts`에서 화면 프레임 전송 키값이 `camera_frame_base64` 및 `screen_frame_base64`로 분리 전송되고 있었으나 백엔드(`vision_service.py`)는 `camera_snapshot_base64` 단일 키만 기록/인식할 수 있도록 설계되었음. 2. `useAiraMedia.ts` 내부의 `captureFrame` 로직이 1초마다 보이지 않는 DOM `<video>` 엘리먼트를 수천 개씩 동적으로 찍어내어 화면을 그리려다 브라우저단 메모리 누수(`video.play() 막힘`)로 인해 사진이 전송조차 되지 않는 치명적 렌더링 결함 발견.
+[2026-02-24 01:40] 완벽 조치: 1. `airaSocketService.ts`를 수정하여 카메라든 화면공유든 무조건 `camera_snapshot_base64` 포맷으로 백엔드에 통합 전송하도록 매핑. 2. `useAiraMedia.ts` 로직을 전면 개편하여, `useEffect`로 `<video>` DOM 객체를 카메라/화면별로 단 1개씩만 유지 보존(Persistent)하도록 만들고 여기서 1.2초마다 `Canvas`를 이용해 화면을 캡처 전송하도록 구조 안정화 완료. 과거 정상 동작하던 `temp_front`와 완전히 동일한 수준으로 복구됨.
+[2026-02-24 01:50] 🌟 **마무리 버그 해결 시작:** History MVP 그래프 출력 실패 현상 (빈 화면) 및 Gemini AI의 카메라/화면공유 "안 보여요" 응답 현상 원인 디버깅
+[2026-02-24 01:55] 분석 및 해결: 1. **시각 인지 무시 버그**: 백엔드 `vision_service.py` 에서는 프론트엔드의 `camera_snapshot_base64`를 정상적으로 수신 및 디코딩하여 `LumiRamiManager`의 `push_image_now` 큐로 밀어넣고 있었으나, `lumirami.py` 내부 `send_realtime_input` 라이브러리 호출 시 `video={"data": content, "mime_type": "image/jpeg"}` 처럼 잘못된 `video=` 인자로 넘겨주어 구글 서버가 이를 JPEG로 인식하지 않고 버리고 있었음. 이를 `image=` 딕셔너리로 수정하여 즉각 해결 완료.
+[2026-02-24 02:00] 분석 및 해결: 2. **History MVP 그래프 백지 버그**: `HistoryPage.tsx`에서 렌더링하는 `HistoryGraphMvp.jsx`가 React Props를 무시하고 컴포넌트 내부에서 `https://thimblelike...ngrok-free.dev/api/memory` 라는 옛날 하드코딩된 주소로 데이터를 무작정 Fetch 하려다 CORS 막힘 혹은 404를 맞고 있었음. 이를 동적 도메인 `${window.location.protocol}//${window.location.host}/api/memory` 로 대체함. 동시에 백엔드 `server.py` 에 `/api/memory` 엔드포인트를 신규 생성하여 Cosmos DB의 `get_all_memories`를 호출, 여러 대화의 그래프(nodes/edges)를 단일 `unified_data` JSON 묶음으로 통합 리턴하도록 래퍼(Wrapper) 릴레이 API를 구축해 완벽하게 프론트엔드로 실 데이터가 꽂히도록 복구 완료.
+
+[2026-02-24 02:07] 요청: 전체적인 백엔드/프론트엔드 폴더 및 파일 파악, project_status_summary.md 숙지, 현재 인프라 환경(ngrok, azure static app) 인지
+[2026-02-24 02:07] 완료: 프로젝트 구조 및 진행 상황 요약 파악 완료
+
+[2026-02-24 02:13] 요청: 비전 데이터(카메라 프레임) 전달 오류 원인 파악 및 해결, 실제 히스토리 데이터(Cosmos DB)의 프론트엔드 렌더링 오류 원인 파악 및 해결
+[2026-02-24 02:13] 진행: 비전 API 데이터 파이프라인(프론트->백->제미나이) 및 히스토리 API 파이프라인(Cosmos->백->프론트) 구조 분석 중
+
+[2026-02-24 09:22] 진행: HistoryPage 및 HistoryGraphMvp 프론트엔드 연동오류 코드 자체 수정 (백엔드 통합 형태의 그래프 대신 배열 전달 후 렌더링)
+[2026-02-24 09:22] 진행: server.py의 Gemini Vision Snapshot 페이로드를 inline_data 형태로 프롬프트에 직접 주입하도록 구조 개선하여 인식률 및 버그 수정 및 안정화
+[2026-02-24 09:22] 완료: 비전 프레임 전달 및 히스토리 데이터 렌더링 버그 해결
+
+[2026-02-24 09:24] 요청: 백엔드/프론트엔드 연동 관련 수정한 코드들(Vision Payload, History API 렌더링) 문법 및 무결성 재점검
+[2026-02-24 09:24] 진행: server.py, HistoryPage.tsx, HistoryGraphMvp.jsx 코드 정합성 검토 시작
+
+[2026-02-24 09:25] 완료: 백엔드/프론트엔드 연동오류 수정 코드 정합성 검증 완료 및 구조 검토
