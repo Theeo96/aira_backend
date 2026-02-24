@@ -360,10 +360,6 @@ class LumiRamiManager:
                             except asyncio.CancelledError: break
                             except Exception as e:
                                 print(f"[{name}] Send Loop Error: {e}")
-                                # [Reliability Fix] Re-queue
-                                if 'item' in locals():
-                                    print(f"[{name}] Re-queueing failed item.")
-                                    await my_queue.put(item) 
                                 break
 
                     sender_task = asyncio.create_task(send_loop())

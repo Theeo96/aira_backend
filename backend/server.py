@@ -615,12 +615,15 @@ async def audio_websocket(ws: WebSocket):
         import base64 as _b64
         frame_tag = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%H:%M:%S")
         
-        # 1. Send the image bytes first
-        if hasattr(lumi_rami_manager, "push_image"):
-            await lumi_rami_manager.push_image(snapshot_bytes)
-            
-        # 2. Add text prompt describing the image
+        # We append inline base64 string directly into prompt Turn instead of unreliable realtime_input.
+        b64_str = _b64.b64encode(snapshot_bytes).decode("utf-8")
         parts = [
+            {
+                "inline_data": {
+                    "mime_type": "image/jpeg",
+                    "data": b64_str
+                }
+            },
             {
                 "text": (
                     "[VISION TURN]\n"
@@ -629,7 +632,7 @@ async def audio_websocket(ws: WebSocket):
                     "Only use memory if it does not conflict with the frame."
                 )
             },
-            {"text": f"사용자 질문: {str(user_text or '')}"}
+            {"text": f"사용자: {str(user_text or '')}"}
         ]
         
         payload = [{"role": "user", "parts": parts}]
@@ -1468,6 +1471,25 @@ async def logout(request: Request, redirect_target: str = "http://localhost:5173
     request.session.pop('user', None)
     request.session.pop('token', None)
     return RedirectResponse(url=redirect_target)
+
+@app.get("/api/memory")
+async def get_user_memory(token: str = None):
+    """
+    Serve the unified memory JSON data to the React History MVP Graph.
+    Expected frontend query: /api/memory?token=xxx@gmail.com
+    """
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing user token")
+    
+    # In a real app we would verify the token. Here we use it as email/userid.
+    user_email = token.strip()
+    try:
+        memories = await asyncio.to_thread(cosmos_service.get_all_memories, user_email)
+        return {"data": memories}
+        
+    except Exception as e:
+        print(f"[API] Error fetching memory for {user_email}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # --- Static Files (Frontend) ---
 FRONTEND_BUILD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "temp_front", "out")
