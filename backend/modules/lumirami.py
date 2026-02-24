@@ -319,7 +319,7 @@ class LumiRamiManager:
                                         await session.send_realtime_input(audio={"data": content, "mime_type": "audio/pcm;rate=16000"})
                                     elif source == "image":
                                         print(f"[{name}] Sending IMAGE via realtime_input...")
-                                        await session.send_realtime_input(image={"data": content, "mime_type": "image/jpeg"})
+                                        await session.send_realtime_input(media={"data": content, "mime_type": "image/jpeg"})
                                     elif source == "context":
                                         print(f"[{name}] Sending SILENT CTX: {content[:30]}...")
                                         await session.send_client_content(
@@ -360,10 +360,6 @@ class LumiRamiManager:
                             except asyncio.CancelledError: break
                             except Exception as e:
                                 print(f"[{name}] Send Loop Error: {e}")
-                                # [Reliability Fix] Re-queue
-                                if 'item' in locals():
-                                    print(f"[{name}] Re-queueing failed item.")
-                                    await my_queue.put(item) 
                                 break
 
                     sender_task = asyncio.create_task(send_loop())
